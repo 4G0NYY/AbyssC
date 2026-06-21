@@ -8,9 +8,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod archive_kind;
+mod browser;
 mod theme;
+mod update;
 
 use archive_kind::ArchiveKind;
+use browser::{Activated, BrowseRow, Location, RowKind};
+use update::UpdateInfo;
 
 use archive_engine::{CodecOptions, Format, Listing, Progress};
 use iced::widget::{
@@ -24,15 +28,67 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn main() -> iced::Result {
+    let launch = parse_launch();
     iced::application("AbyssC — compression from the depths", Abyss::update, Abyss::view)
         .theme(|_| theme::abyss())
         .subscription(Abyss::subscription)
         .window(iced::window::Settings {
             size: Size::new(1000.0, 700.0),
             min_size: Some(Size::new(840.0, 620.0)),
+            icon: window_icon(),
             ..Default::default()
         })
-        .run_with(|| (Abyss::new(), Task::none()))
+        .run_with(move || (Abyss::with_launch(launch), startup_task()))
+}
+
+/// The window/taskbar icon, decoded from the embedded `.ico`.
+fn window_icon() -> Option<iced::window::Icon> {
+    iced::window::icon::from_file_data(include_bytes!("../assets/AbyssC.ico"), None).ok()
+}
+
+/// Work kicked off the moment the app launches: a one-shot update check, run on
+/// a blocking thread so the window appears instantly regardless of the network.
+fn startup_task() -> Task<Message> {
+    Task::perform(
+        async { tokio::task::spawn_blocking(|| update::check().ok().flatten()).await.ok().flatten() },
+        Message::UpdateChecked,
+    )
+}
+
+/// How the app was asked to open — used by the Windows context-menu verbs.
+#[derive(Clone, Debug)]
+enum Launch {
+    Normal,
+    Compress(PathBuf),
+    Extract(PathBuf),
+    Browse(PathBuf),
+}
+
+/// Parse `--compress|--extract|--browse <path>`, or infer from a bare path.
+/// Anything unrecognized opens the app normally.
+fn parse_launch() -> Launch {
+    let mut args = std::env::args_os().skip(1);
+    let Some(first) = args.next() else { return Launch::Normal };
+    let first = first.to_string_lossy().into_owned();
+
+    let with_path = |a: Option<std::ffi::OsString>| a.map(PathBuf::from);
+
+    match first.as_str() {
+        "--compress" | "-c" => with_path(args.next()).map(Launch::Compress).unwrap_or(Launch::Normal),
+        "--extract" | "-x" => with_path(args.next()).map(Launch::Extract).unwrap_or(Launch::Normal),
+        "--browse" | "-b" => with_path(args.next()).map(Launch::Browse).unwrap_or(Launch::Normal),
+        _ => {
+            // A bare path: archives open for extraction, everything else to compress.
+            let path = PathBuf::from(first);
+            if !path.exists() {
+                Launch::Normal
+            } else if !path.is_dir() && Format::from_path(&path).is_some() {
+                Launch::Extract(path)
+            } else {
+                Launch::Compress(path)
+            }
+        }
+    }
 }
 
 // --- State -----------------------------------------------------------------
@@ -41,6 +97,7 @@ pub fn main() -> iced::Result {
 enum Mode {
     Compress,
     Extract,
+    Browse,
 }
 
 /// What the bottom band reports.
@@ -74,14 +131,23 @@ struct Abyss {
     listing: Option<Listing>,
     dest: Option<PathBuf>,
 
+    // Browse / Commander side.
+    location: Location,
+    rows: Vec<BrowseRow>,
+    selected: Option<usize>,
+    browse_error: Option<String>,
+
     // Shared.
     job: Option<Job>,
     status: Status,
     fraction: f32,
+    update: Option<UpdateInfo>,
 }
 
 impl Abyss {
     fn new() -> Self {
+        let location = browser::initial();
+        let rows = browser::rows_for(&location);
         Self {
             mode: Mode::Compress,
             inputs: Vec::new(),
@@ -94,10 +160,36 @@ impl Abyss {
             archive_format: None,
             listing: None,
             dest: None,
+            location,
+            rows,
+            selected: None,
+            browse_error: None,
             job: None,
             status: Status::Idle,
             fraction: 0.0,
+            update: None,
         }
+    }
+
+    /// Build the app and apply a launch intent (from the command line).
+    fn with_launch(launch: Launch) -> Self {
+        let mut app = Self::new();
+        match launch {
+            Launch::Normal => {}
+            Launch::Compress(path) => {
+                app.mode = Mode::Compress;
+                app.add_inputs(vec![path]);
+            }
+            Launch::Extract(path) => {
+                app.mode = Mode::Extract;
+                app.load_archive(path);
+            }
+            Launch::Browse(path) => {
+                app.mode = Mode::Browse;
+                app.navigate_to_dropped(path);
+            }
+        }
+        app
     }
 
     fn busy(&self) -> bool {
@@ -126,10 +218,23 @@ enum Message {
     OpenArchive,
     ChooseDest,
 
+    // Browse / Commander.
+    BrowseActivate(usize),
+    BrowseUp,
+    BrowseHome,
+    BrowseRefresh,
+    BrowseToCompress,
+    BrowseExtractHere,
+
     // Shared.
     Start,
     Tick,
     FileDropped(PathBuf),
+
+    // Update prompt.
+    UpdateChecked(Option<UpdateInfo>),
+    OpenRelease,
+    DismissUpdate,
 }
 
 // --- Update ----------------------------------------------------------------
@@ -207,12 +312,56 @@ impl Abyss {
                 }
             }
 
+            Message::BrowseActivate(i) => {
+                if let Some(row) = self.rows.get(i).cloned() {
+                    match browser::activate(&self.location, &row) {
+                        Activated::Go(loc) => self.set_location(loc),
+                        Activated::Stay => self.selected = Some(i),
+                        Activated::Error(e) => self.browse_error = Some(e),
+                    }
+                }
+            }
+            Message::BrowseUp => {
+                if let Some(loc) = browser::up(&self.location) {
+                    self.set_location(loc);
+                }
+            }
+            Message::BrowseHome => self.set_location(Location::Drives),
+            Message::BrowseRefresh => {
+                let here = self.location.clone();
+                self.set_location(here);
+            }
+            Message::BrowseToCompress => {
+                if let Some(path) = self.selected_fs_path() {
+                    self.add_inputs(vec![path]);
+                    self.mode = Mode::Compress;
+                    self.status = Status::Idle;
+                }
+            }
+            Message::BrowseExtractHere => {
+                if let Location::Archive { path, .. } = &self.location {
+                    let path = path.clone();
+                    self.load_archive(path);
+                    self.mode = Mode::Extract;
+                }
+            }
+
             Message::Start => self.start_job(),
             Message::Tick => self.poll_job(),
             Message::FileDropped(path) => match self.mode {
                 Mode::Compress => self.add_inputs(vec![path]),
                 Mode::Extract => self.load_archive(path),
+                Mode::Browse => self.navigate_to_dropped(path),
             },
+
+            Message::UpdateChecked(info) => self.update = info,
+            Message::OpenRelease => {
+                if let Some(u) = &self.update {
+                    open_url(&u.url);
+                }
+                self.update = None;
+            }
+            Message::DismissUpdate => self.update = None,
         }
         Task::none()
     }
@@ -288,6 +437,46 @@ impl Abyss {
         }
     }
 
+    fn set_location(&mut self, loc: Location) {
+        self.location = loc;
+        self.rows = browser::rows_for(&self.location);
+        self.selected = None;
+        self.browse_error = None;
+    }
+
+    /// The full on-disk path of the selected filesystem row, if it is one.
+    fn selected_fs_path(&self) -> Option<PathBuf> {
+        let Location::Fs(dir) = &self.location else { return None };
+        let row = self.rows.get(self.selected?)?;
+        matches!(row.kind, RowKind::File | RowKind::Dir | RowKind::Archive)
+            .then(|| dir.join(&row.name))
+    }
+
+    /// Resolve a path dropped onto the Commander into a sensible location.
+    fn navigate_to_dropped(&mut self, path: PathBuf) {
+        if path.is_dir() {
+            self.set_location(Location::Fs(path));
+        } else if Format::from_path(&path).is_some() {
+            // Open the archive at its root via the filesystem row machinery.
+            if let Some(dir) = path.parent() {
+                self.set_location(Location::Fs(dir.to_path_buf()));
+                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                    if let Some(i) = self.rows.iter().position(|r| {
+                        r.kind == RowKind::Archive && r.name == name
+                    }) {
+                        if let Activated::Go(loc) =
+                            browser::activate(&self.location, &self.rows[i].clone())
+                        {
+                            self.set_location(loc);
+                        }
+                    }
+                }
+            }
+        } else if let Some(dir) = path.parent() {
+            self.set_location(Location::Fs(dir.to_path_buf()));
+        }
+    }
+
     fn ready(&self) -> bool {
         if self.busy() {
             return false;
@@ -297,6 +486,7 @@ impl Abyss {
             Mode::Extract => {
                 self.archive.is_some() && self.archive_format.is_some() && self.dest.is_some()
             }
+            Mode::Browse => false,
         }
     }
 
@@ -355,6 +545,7 @@ impl Abyss {
                     *out.lock().unwrap() = Some(msg);
                 });
             }
+            Mode::Browse => return,
         }
 
         self.job = Some(Job { progress, outcome });
@@ -384,9 +575,11 @@ impl Abyss {
 
 impl Abyss {
     fn view(&self) -> Element<'_, Message> {
-        let content = column![self.header(), self.body(), self.status_band()]
-            .spacing(16)
-            .height(Length::Fill);
+        let mut content = column![self.header()].spacing(16).height(Length::Fill);
+        if let Some(update) = &self.update {
+            content = content.push(self.update_banner(update));
+        }
+        content = content.push(self.body()).push(self.status_band());
 
         container(content)
             .style(theme::root)
@@ -394,6 +587,33 @@ impl Abyss {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+
+    fn update_banner(&self, update: &UpdateInfo) -> Element<'_, Message> {
+        container(
+            row![
+                text(format!(
+                    "✦  A new depth has surfaced — v{} awaits.",
+                    update.version
+                ))
+                .size(13)
+                .color(theme::TEXT)
+                .width(Length::Fill),
+                button(text("Update").size(13))
+                    .style(theme::primary)
+                    .padding([7, 18])
+                    .on_press(Message::OpenRelease),
+                button(text("Later").size(13))
+                    .style(theme::ghost)
+                    .padding([7, 14])
+                    .on_press(Message::DismissUpdate),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .style(theme::update_banner)
+        .padding([10, 16])
+        .into()
     }
 
     fn header(&self) -> Element<'_, Message> {
@@ -411,6 +631,7 @@ impl Abyss {
             row![
                 self.tab("Compress", Mode::Compress),
                 self.tab("Extract", Mode::Extract),
+                self.tab("Commander", Mode::Browse),
             ]
             .spacing(4),
         )
@@ -440,6 +661,7 @@ impl Abyss {
         let inner = match self.mode {
             Mode::Compress => self.compress_view(),
             Mode::Extract => self.extract_view(),
+            Mode::Browse => self.browse_view(),
         };
         container(inner)
             .style(theme::panel)
@@ -724,9 +946,135 @@ impl Abyss {
         column![open_bar, contents, dest_row].spacing(16).height(Length::Fill).into()
     }
 
+    // --- Browse / Commander ------------------------------------------------
+
+    fn browse_view(&self) -> Element<'_, Message> {
+        let up = button(text("⬆ Up").size(13))
+            .style(theme::ghost)
+            .padding([7, 14])
+            .on_press_maybe(self.location.can_up().then_some(Message::BrowseUp));
+        let home = button(text("⌂").size(15)).style(theme::ghost).padding([7, 12])
+            .on_press(Message::BrowseHome);
+        let refresh = button(text("⟳").size(15)).style(theme::ghost).padding([7, 12])
+            .on_press(Message::BrowseRefresh);
+
+        let loc_bar = container(text(self.location.label()).size(13).color(theme::TEXT))
+            .style(theme::row_item)
+            .padding([8, 14])
+            .width(Length::Fill);
+
+        // Context action depends on where we stand.
+        let action: Element<_> = if self.location.in_archive() {
+            button(text("Extract archive ⤓").size(13))
+                .style(theme::primary)
+                .padding([8, 16])
+                .on_press(Message::BrowseExtractHere)
+                .into()
+        } else if self.selected_fs_path().is_some() {
+            button(text("→ Add to Compress").size(13))
+                .style(theme::ghost)
+                .padding([8, 16])
+                .on_press(Message::BrowseToCompress)
+                .into()
+        } else {
+            Space::with_width(Length::Fixed(0.0)).into()
+        };
+
+        let toolbar = row![up, home, refresh, loc_bar, action]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+        let mut list = column![].spacing(2);
+        for (i, row) in self.rows.iter().enumerate() {
+            list = list.push(self.browse_line(i, row));
+        }
+
+        let body: Element<_> = if let Some(err) = &self.browse_error {
+            column![
+                container(scrollable(list).height(Length::Fill))
+                    .style(theme::card)
+                    .padding(10)
+                    .height(Length::Fill),
+                text(format!("✖ {err}")).size(12).color(theme::RED),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            container(scrollable(list).height(Length::Fill))
+                .style(theme::card)
+                .padding(10)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        };
+
+        column![toolbar, body].spacing(14).height(Length::Fill).into()
+    }
+
+    fn browse_line(&self, i: usize, row: &BrowseRow) -> Element<'_, Message> {
+        let (glyph, glyph_color) = match row.kind {
+            RowKind::Parent => ("⤴", theme::MUTED),
+            RowKind::Drive => ("▣", theme::CYAN),
+            RowKind::Dir => ("▸", theme::CYAN),
+            RowKind::Archive => ("◈", theme::VIOLET),
+            RowKind::File => ("·", theme::MUTED),
+        };
+        let name_color = match row.kind {
+            RowKind::Archive => theme::VIOLET,
+            RowKind::Dir | RowKind::Drive => theme::CYAN,
+            RowKind::Parent => theme::MUTED,
+            RowKind::File => theme::TEXT,
+        };
+        let size = match row.kind {
+            RowKind::File | RowKind::Archive => fmt_bytes(row.size.unwrap_or(0)),
+            _ => String::new(),
+        };
+        let style =
+            if self.selected == Some(i) { theme::browse_row_selected } else { theme::browse_row };
+
+        button(
+            row![
+                text(glyph).size(14).color(glyph_color).width(Length::Fixed(26.0)),
+                text(row.name.clone()).size(13).color(name_color).width(Length::Fill),
+                text(size).size(12).color(theme::MUTED),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .style(style)
+        .padding([6, 10])
+        .width(Length::Fill)
+        .on_press(Message::BrowseActivate(i))
+        .into()
+    }
+
+    fn browse_status(&self) -> Element<'_, Message> {
+        let (msg, color) = if let Some(err) = &self.browse_error {
+            (err.clone(), theme::RED)
+        } else if let Some(path) = self.selected_fs_path() {
+            (path.display().to_string(), theme::TEXT)
+        } else {
+            let count = self.rows.iter().filter(|r| r.kind != RowKind::Parent).count();
+            let hint = if self.location.in_archive() {
+                "peering inside — nothing is unpacked to disk"
+            } else {
+                "double-step a folder or archive to enter"
+            };
+            (format!("{count} item(s)  ·  {hint}"), theme::MUTED)
+        };
+        container(text(msg).size(13).color(color).width(Length::Fill))
+            .style(theme::status_bar)
+            .padding(16)
+            .into()
+    }
+
     // --- Status band -------------------------------------------------------
 
     fn status_band(&self) -> Element<'_, Message> {
+        if self.mode == Mode::Browse {
+            return self.browse_status();
+        }
+
         let (msg, msg_color): (String, _) = match &self.status {
             Status::Idle => (self.idle_hint(), theme::MUTED),
             Status::Running => (
@@ -735,6 +1083,7 @@ impl Abyss {
                     match self.mode {
                         Mode::Compress => "Folding",
                         Mode::Extract => "Unfolding",
+                        Mode::Browse => "",
                     },
                     self.fraction * 100.0
                 ),
@@ -747,6 +1096,7 @@ impl Abyss {
         let action_label = match self.mode {
             Mode::Compress => "Compress",
             Mode::Extract => "Extract",
+            Mode::Browse => "",
         };
         let action = button(text(action_label).size(15))
             .style(theme::primary)
@@ -789,6 +1139,7 @@ impl Abyss {
                 "Choose where to unfold it.".to_string()
             }
             Mode::Extract => "Ready to unfold.".to_string(),
+            Mode::Browse => String::new(),
         }
     }
 }
@@ -831,6 +1182,19 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 fn available_cores() -> i32 {
     std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1)
+}
+
+/// Open a URL in the user's default browser.
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    {
+        // `start` is a cmd builtin; the empty "" is its (ignored) window title.
+        let _ = std::process::Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 fn fmt_bytes(bytes: u64) -> String {

@@ -1,6 +1,10 @@
 /target
 
+# Installer build output
+/installer/dist
+
 # Local Crap (not needed, just testing)
 /test_unzipped
 test.txt
 test_archive.zip
+*.log

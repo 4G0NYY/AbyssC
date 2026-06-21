@@ -70,6 +70,32 @@ cargo run --release -p abyss_gui   # open the window
 
 ---
 
+## 🜍 Binding — The Installer
+
+To bind AbyssC to a Windows machine, there is a clean [Inno Setup](https://jrsoftware.org/isinfo.php)
+installer in [`installer/`](installer/). It builds the release binaries, then forges a single `Setup.exe`:
+
+```powershell
+# Requires Inno Setup 6 (winget install JRSoftware.InnoSetup)
+installer\build.ps1
+# → installer\dist\AbyssC-<version>-Setup.exe
+```
+
+The installer reads its version straight from the workspace `Cargo.toml`, so it
+never drifts from the binaries. Running it (as administrator) will:
+
+- Install **`abyssc.exe`** (CLI) and **`abyssc-gui.exe`** (GUI) to *Program Files*.
+- Add the CLI to the system **PATH** (idempotent — and removed again on uninstall).
+- Place **Start Menu** shortcuts (and an optional desktop icon).
+- Carve a cascading **AbyssC** entry into the right-click menu of files and folders:
+  *Compress with AbyssC* · *Extract with AbyssC* · *Open in AbyssC Commander*.
+
+Each verb hands the selected path to the GUI (`--compress`, `--extract`,
+`--browse`), which opens straight into the right mode. A tidy uninstaller undoes
+all of it — binaries, PATH entry, and registry keys alike.
+
+---
+
 ## 🔮 Incantations — Usage
 
 ```
@@ -148,14 +174,22 @@ strips away its clutter.
 cargo run --release -p abyss_gui
 ```
 
-- **Two modes.** *Compress* (gather sources, choose a form, fold them) and
-  *Extract* (open an archive, peer inside, unfold it).
+- **Three modes.** *Compress* (gather sources, choose a form, fold them),
+  *Extract* (open an archive, peer inside, unfold it), and *Commander*.
+- **The Commander.** A file browser that treats archives as folders. Step into a
+  `.tar.zst` and walk its directories as though they lay open on disk — nothing
+  is ever decompressed to look inside. From within, extract the whole thing in a
+  click; from the filesystem, send any file straight to *Compress*.
 - **Drag the world in.** Drop files and folders straight onto the window.
 - **It never freezes.** The engine crunches on a worker thread while the window
   stays fluid; a live bar reflects a lock-free `Progress` counter polled from the
   UI. A 100 GB fold draws at the same frame rate as a 100 KB one.
 - **One palette.** Frost-cyan and abyssal violet on near-black — Skirk's colors,
   not a surface dweller's.
+- **Stays current.** On launch it quietly asks GitHub for the latest release; if a
+  newer depth has surfaced, a small banner offers to fetch it. No telemetry, no
+  account, no server of our own — just a single anonymous request, failing silent
+  when offline.
 
 The GUI shares the engine with the CLI exactly; neither knows the other exists.
 

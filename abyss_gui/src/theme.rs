@@ -143,6 +143,16 @@ pub fn chip(_t: &Theme) -> container::Style {
     }
 }
 
+/// The "a new version awaits" banner — violet-tinted, cyan-edged.
+pub fn update_banner(_t: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(rgba(138, 124, 240, 0.12))),
+        border: Border { color: rgba(138, 124, 240, 0.5), width: 1.0, radius: Radius::from(10.0) },
+        ..Default::default()
+    }
+}
+
 // --- Buttons ---------------------------------------------------------------
 
 /// The primary call-to-action (Compress / Extract). Frost-cyan with a glow.
@@ -222,6 +232,30 @@ pub fn danger_ghost(_t: &Theme, status: button::Status) -> button::Style {
         background: Some(Background::Color(Color::TRANSPARENT)),
         text_color,
         border: rounded(8.0),
+        shadow: Shadow::default(),
+    }
+}
+
+/// A Commander list row.
+pub fn browse_row(_t: &Theme, status: button::Status) -> button::Style {
+    let bg = match status {
+        button::Status::Hovered => Background::Color(rgba(91, 214, 208, 0.08)),
+        _ => Background::Color(Color::TRANSPARENT),
+    };
+    button::Style {
+        background: Some(bg),
+        text_color: TEXT,
+        border: rounded(7.0),
+        shadow: Shadow::default(),
+    }
+}
+
+/// The selected Commander row.
+pub fn browse_row_selected(_t: &Theme, _s: button::Status) -> button::Style {
+    button::Style {
+        background: Some(Background::Color(rgba(43, 168, 164, 0.16))),
+        text_color: TEXT,
+        border: Border { color: rgba(91, 214, 208, 0.4), width: 1.0, radius: Radius::from(7.0) },
         shadow: Shadow::default(),
     }
 }

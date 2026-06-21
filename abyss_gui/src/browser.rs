@@ -160,7 +160,9 @@ pub fn activate(loc: &Location, row: &BrowseRow) -> Activated {
             let Location::Fs(dir) = loc else { return Stay };
             let target = dir.join(&row.name);
             match Format::from_path(&target) {
-                Some(format) => match archive_engine::list(&target, format) {
+                // The Commander browses unsealed archives; an encrypted `.abyss`
+                // needs a password, which the Extract tab handles.
+                Some(format) => match archive_engine::list(&target, format, None) {
                     Ok(listing) => Go(Location::Archive {
                         path: target,
                         format,

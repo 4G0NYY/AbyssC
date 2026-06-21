@@ -8,6 +8,7 @@
 //! etc.) contained in one place, and lets the container layer (raw stream, tar, ...)
 //! stay completely codec-agnostic.
 
+use crate::ans;
 use std::io::{self, Read, Write};
 
 /// Streaming buffer size used to wrap source/sink handles (1 MiB).
@@ -33,11 +34,16 @@ pub enum Codec {
     Bzip2,
     /// Brotli.
     Brotli,
+    /// ANS — the engine's own from-scratch asymmetric numeral system entropy
+    /// coder. Backs the `.abyss` / `.tar.ans` / `.ans` forms.
+    Ans,
 }
 
 /// Tunables shared by every codec. Fields that a codec does not understand are
 /// simply ignored, so callers never have to special-case the codec.
-#[derive(Clone, Copy, Debug)]
+///
+/// (Not `Copy`: it can carry an owned password for sealed `.abyss` archives.)
+#[derive(Clone, Debug, Default)]
 pub struct CodecOptions {
     /// Compression level. `None` means "use the codec's default". The value is
     /// clamped to each codec's valid range, so a single `--level` flag works
@@ -46,17 +52,21 @@ pub struct CodecOptions {
     /// Worker threads for codecs that support parallel encoding (currently Zstd).
     /// `0` means "use all available cores".
     pub threads: u32,
-}
-
-impl Default for CodecOptions {
-    fn default() -> Self {
-        Self { level: None, threads: 0 }
-    }
+    /// Password for producing a sealed (encrypted) `.abyss` archive. `None`
+    /// leaves the archive unencrypted; ignored by every non-`.abyss` form.
+    pub password: Option<String>,
 }
 
 impl CodecOptions {
     pub fn new(level: Option<i32>, threads: u32) -> Self {
-        Self { level, threads }
+        Self { level, threads, password: None }
+    }
+
+    /// Attach a password, sealing the resulting `.abyss` archive. An empty or
+    /// blank password is treated as "no password".
+    pub fn with_password(mut self, password: Option<String>) -> Self {
+        self.password = password.filter(|p| !p.is_empty());
+        self
     }
 }
 
@@ -71,6 +81,7 @@ impl Codec {
             Codec::Xz => "xz",
             Codec::Bzip2 => "bzip2",
             Codec::Brotli => "brotli",
+            Codec::Ans => "ans",
         }
     }
 
@@ -84,6 +95,7 @@ impl Codec {
             Codec::Xz => &[".xz"],
             Codec::Bzip2 => &[".bz2"],
             Codec::Brotli => &[".br"],
+            Codec::Ans => &[".ans"],
         }
     }
 
@@ -144,6 +156,11 @@ impl Codec {
                     enc.flush()?;
                 }
             }
+            Codec::Ans => {
+                let mut enc = ans::AnsWriter::new(&mut sink)?;
+                write_payload(&mut enc)?;
+                enc.finish()?;
+            }
         }
         sink.flush()?;
         Ok(())
@@ -182,6 +199,10 @@ impl Codec {
             }
             Codec::Brotli => {
                 let mut dec = brotli::Decompressor::new(&mut source, BUF);
+                read_payload(&mut dec)?;
+            }
+            Codec::Ans => {
+                let mut dec = ans::AnsReader::new(&mut source)?;
                 read_payload(&mut dec)?;
             }
         }

@@ -1,5 +1,6 @@
 //! Inspect an archive's contents without extracting it.
 
+use crate::abyss;
 use crate::decompress::raw_output_name;
 use crate::format::{Container, Format};
 use std::fs::File;
@@ -30,9 +31,14 @@ pub struct Listing {
 }
 
 /// List the contents of `src` interpreted as `format`, without extracting.
-pub fn list(src: &Path, format: Format) -> io::Result<Listing> {
+///
+/// `password` is only consulted for a sealed `.abyss` archive; listing an
+/// encrypted archive still requires the password (its table of contents lives
+/// behind the encryption layer).
+pub fn list(src: &Path, format: Format, password: Option<&str>) -> io::Result<Listing> {
     let entries = match format.container {
         Container::Zip => list_zip(src)?,
+        Container::Abyss => abyss::list(src, password)?,
         Container::Tar => list_tar(src, format)?,
         Container::Raw => {
             return Ok(Listing {

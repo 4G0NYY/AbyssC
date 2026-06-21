@@ -157,6 +157,8 @@ struct Abyss {
     threads: i32,
     output: Option<PathBuf>,
     output_is_auto: bool,
+    /// Password for sealing (Compress) or unsealing (Extract) a `.abyss` archive.
+    password: String,
 
     // Extract side.
     archive: Option<PathBuf>,
@@ -197,6 +199,7 @@ impl Abyss {
             threads: 0,
             output: None,
             output_is_auto: true,
+            password: String::new(),
             archive: None,
             archive_format: None,
             listing: None,
@@ -263,6 +266,7 @@ enum Message {
     OutputEdited(String),
     BrowseOutput,
     OutputChosen(Option<PathBuf>),
+    PasswordChanged(String),
 
     // Extract.
     OpenArchive,
@@ -384,6 +388,16 @@ impl Abyss {
                 if let Some(path) = path {
                     self.output = Some(path);
                     self.output_is_auto = false;
+                }
+            }
+            Message::PasswordChanged(pw) => {
+                self.password = pw;
+                // In Extract, a sealed archive's table of contents is itself
+                // behind the password — re-read it as the user types the key.
+                if self.mode == Mode::Extract && self.archive_is_sealed() {
+                    if let Some(path) = self.archive.clone() {
+                        self.load_archive(path);
+                    }
                 }
             }
 
@@ -568,10 +582,20 @@ impl Abyss {
         match Format::from_path(&path) {
             Some(format) => {
                 self.archive_format = Some(format);
-                self.listing = archive_engine::list(&path, format).ok();
                 self.dest = path.parent().map(PathBuf::from);
+                match archive_engine::list(&path, format, self.password_opt()) {
+                    Ok(listing) => {
+                        self.listing = Some(listing);
+                        self.status = Status::Idle;
+                    }
+                    Err(e) => {
+                        // A sealed `.abyss` with no/incorrect password lands here;
+                        // the Extract view will offer the password field.
+                        self.listing = None;
+                        self.status = Status::Failed(format!("could not read archive: {e}"));
+                    }
+                }
                 self.archive = Some(path);
-                self.status = Status::Idle;
                 self.fraction = 0.0;
             }
             None => {
@@ -583,6 +607,20 @@ impl Abyss {
                 );
             }
         }
+    }
+
+    /// The current password as an engine argument: `None` when blank.
+    fn password_opt(&self) -> Option<&str> {
+        if self.password.is_empty() { None } else { Some(self.password.as_str()) }
+    }
+
+    /// Whether the currently-loaded archive is a `.abyss` form (which may be
+    /// sealed and so may want a password).
+    fn archive_is_sealed(&self) -> bool {
+        matches!(
+            self.archive_format.map(|f| f.container),
+            Some(archive_engine::Container::Abyss)
+        )
     }
 
     fn set_location(&mut self, loc: Location) {
@@ -703,7 +741,15 @@ impl Abyss {
                 let dest = self.output.clone().unwrap();
                 let format = self.kind.format();
                 let level = self.kind.level_range().map(|_| self.level);
-                let opts = CodecOptions::new(level, self.threads.max(0) as u32);
+                // Only `.abyss` honors a password; for every other form it is left
+                // unset so nothing is silently (and uselessly) carried along.
+                let password = self
+                    .kind
+                    .supports_password()
+                    .then(|| self.password.clone())
+                    .filter(|p| !p.is_empty());
+                let opts =
+                    CodecOptions::new(level, self.threads.max(0) as u32).with_password(password);
                 let label = self.kind.to_string();
                 thread::spawn(move || {
                     let start = Instant::now();
@@ -727,10 +773,16 @@ impl Abyss {
                 let src = self.archive.clone().unwrap();
                 let dest = self.dest.clone().unwrap();
                 let format = self.archive_format.unwrap();
+                let password = self.password_opt().map(str::to_owned);
                 thread::spawn(move || {
                     let start = Instant::now();
-                    let result =
-                        archive_engine::decompress_with_progress(&src, &dest, format, &p);
+                    let result = archive_engine::decompress_with_progress(
+                        &src,
+                        &dest,
+                        format,
+                        &p,
+                        password.as_deref(),
+                    );
                     let msg = match result {
                         Ok(()) => Ok(format!(
                             "Unfolded to {}  ·  {:.2}s",
@@ -944,10 +996,30 @@ impl Abyss {
             column![scrollable(items).height(Length::Fill), footer].spacing(10).into()
         };
 
-        column![add_bar, list, self.settings_row(), self.output_row()]
+        let mut col = column![add_bar, list, self.settings_row(), self.output_row()]
             .spacing(16)
-            .height(Length::Fill)
-            .into()
+            .height(Length::Fill);
+        if self.kind.supports_password() {
+            col = col.push(self.password_row("optional — seal the orb against the surface"));
+        }
+        col.into()
+    }
+
+    /// A masked password field, shared by the Compress (seal) and Extract
+    /// (unseal) views.
+    fn password_row(&self, placeholder: &str) -> Element<'_, Message> {
+        row![
+            text("Key →").size(13).color(theme::MUTED),
+            text_input(placeholder, &self.password)
+                .on_input(Message::PasswordChanged)
+                .secure(true)
+                .style(theme::field)
+                .padding([9, 12])
+                .width(Length::Fill),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .into()
     }
 
     fn settings_row(&self) -> Element<'_, Message> {
@@ -1146,7 +1218,11 @@ impl Abyss {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        column![open_bar, contents, dest_row].spacing(16).height(Length::Fill).into()
+        let mut col = column![open_bar, contents].spacing(16).height(Length::Fill);
+        if self.archive_is_sealed() {
+            col = col.push(self.password_row("password — unseal this archive"));
+        }
+        col.push(dest_row).into()
     }
 
     // --- Browse / Commander ------------------------------------------------
@@ -1422,7 +1498,8 @@ fn open_archive_member(src: &Path, format: Format, member: &str, name: &str) -> 
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dest = std::env::temp_dir().join("AbyssC").join(stamp.to_string()).join(name);
-    archive_engine::extract_member(src, format, member, &dest).map_err(|e| e.to_string())?;
+    // The Commander only browses unsealed archives, so no password is needed here.
+    archive_engine::extract_member(src, format, member, &dest, None).map_err(|e| e.to_string())?;
     open_path(&dest);
     Ok(())
 }

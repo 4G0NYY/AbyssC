@@ -12,11 +12,12 @@ The surface measures archives by familiarity. The Abyss measures them by **power
 
 One command, many codecs. The format is chosen by the extension you name — nothing more is asked of you.
 
-- **Seven codecs.** `zstd`, `lz4`, `gzip`, `xz`, `bzip2`, `brotli`, and raw `store`.
-- **Three containers.** A single compressed stream, a `tar` bundle, or a portable `zip`.
+- **Eight codecs.** `zstd`, `lz4`, `gzip`, `xz`, `bzip2`, `brotli`, raw `store`, and **`ans`** — our own from-scratch entropy coder.
+- **Four containers.** A single compressed stream, a `tar` bundle, a portable `zip`, or the sealed **`.abyss`** form.
+- **Sealed archives.** The `.abyss` form can be **encrypted with a password** — ChaCha20-Poly1305 over an Argon2id key, authenticated end to end. The surface cannot read what it cannot open.
 - **Streaming by nature.** Bytes flow through 1 MiB buffers. Nothing is held whole in memory — a 100 GB file costs the same RAM as a 100 KB one.
 - **Multithreaded `zstd`.** It claims every core you give it, or as many as you permit.
-- **Whole directories.** `tar.*` and `.zip` swallow entire trees. The single streams take one file, as is their nature.
+- **Whole directories.** `tar.*`, `.zip`, and `.abyss` swallow entire trees. The single streams take one file, as is their nature.
 - **Inspect without touching.** List an archive's contents without unfolding it.
 
 ---
@@ -32,15 +33,19 @@ The engine does not tangle its concerns. An **archive format** is the union of t
    (layout)         (compression)
    ┌─────────┐      ┌──────────────────────────────────┐
    │  Raw    │      │ Store · Gzip · Zstd · Lz4 ·       │
-   │  Tar    │  ×   │ Xz · Bzip2 · Brotli              │
+   │  Tar    │  ×   │ Xz · Bzip2 · Brotli · Ans         │
    │  Zip    │      └──────────────────────────────────┘
+   │  Abyss  │
    └─────────┘
 ```
 
 - **`archive_engine`** — the disciplined core. A library, no voice of its own.
   - `codec.rs` — every algorithm behind one inversion-of-control API. Each codec wraps a stream and handles its own finalization. The container layer never learns their secrets.
+  - `ans.rs` — the engine's **own** entropy coder: a from-scratch, block-based rANS (asymmetric numeral system). Owes nothing to an external crate.
+  - `crypto.rs` — password sealing: an Argon2id key driving a ChaCha20-Poly1305 STREAM. Layered as a plain `Write`/`Read`, so it wraps any stream.
+  - `abyss.rs` — the `.abyss` container: a tar bundle, ANS-coded, optionally encrypted — finalized in one disciplined pass.
   - `format.rs` — `Format = Container + Codec`, with extension detection.
-  - `compress.rs` / `decompress.rs` — dispatch over `Raw`, `Tar`, `Zip`.
+  - `compress.rs` / `decompress.rs` — dispatch over `Raw`, `Tar`, `Zip`, `Abyss`.
   - `zip_archive.rs` — the `zip` path, which bundles and compresses in one pass.
   - `listing.rs` — reads an archive's table of contents.
 - **`orchestrator`** — the hand that gestures. A thin CLI (`abyssc`) that resolves a format and calls the core.
@@ -116,6 +121,8 @@ abyssc compress -o backup.tar.zst  project/ notes.txt   # bundle a tree → zstd
 abyssc compress -o data.lz4        data.bin             # raw velocity
 abyssc compress -o data.zst -l 19 -t 8  data.bin        # crush it, eight cores
 abyssc compress -o site.tar.br     www/                 # brotli a directory
+abyssc compress -o vault.abyss     secrets/             # our own ANS sigil
+abyssc compress -o vault.abyss -p hunter2  secrets/     # …sealed from the surface
 ```
 
 ### Extract
@@ -123,7 +130,26 @@ abyssc compress -o site.tar.br     www/                 # brotli a directory
 ```sh
 abyssc extract -i backup.tar.zst -o ./restored
 abyssc extract -i data.lz4                       # → ./data  (name derived from archive)
+abyssc extract -i vault.abyss -p hunter2 -o ./restored   # unseal a sealed archive
 ```
+
+### Seal — Encrypted `.abyss`
+
+The `.abyss` form is the engine's own: a tar bundle, folded by our from-scratch
+ANS coder, and — when you name a password — **sealed**. The password stretches
+through **Argon2id** into a key; the payload is encrypted and authenticated with
+**ChaCha20-Poly1305**. A wrong password does not yield garbage — it is *refused*,
+and any tampering is caught.
+
+```sh
+abyssc compress -o vault.abyss -p "the depths keep their secrets"  ledger/
+abyssc list     -i vault.abyss -p "the depths keep their secrets"   # contents live behind the key
+abyssc extract  -i vault.abyss -p "the depths keep their secrets" -o ./out
+```
+
+Without the key, a sealed archive will not even show its table of contents — the
+listing itself lies behind the encryption. `-p` applies only to `.abyss`; the
+other forms refuse it rather than silently ignore it.
 
 ### List
 
@@ -180,6 +206,9 @@ cargo run --release -p abyss_gui
   `.tar.zst` and walk its directories as though they lay open on disk — nothing
   is ever decompressed to look inside. From within, extract the whole thing in a
   click; from the filesystem, send any file straight to *Compress*.
+- **Seal it.** Choose the **Abyss (sealed)** form and a password field appears;
+  type a key to encrypt the archive. The Extract tab asks for the key in turn —
+  a sealed archive will not even reveal its contents without it.
 - **Drag the world in.** Drop files and folders straight onto the window.
 - **It never freezes.** The engine crunches on a worker thread while the window
   stays fluid; a live bar reflects a lock-free `Progress` counter polled from the
@@ -199,6 +228,8 @@ The GUI shares the engine with the CLI exactly; neither knows the other exists.
 
 | Extension              | Codec    | Container | Disposition                                   |
 | ---------------------- | -------- | --------- | --------------------------------------------- |
+| `.abyss`               | ans      | abyss     | Our own sigil. Bundles, ANS-codes, can seal.  |
+| `.ans`, `.tar.ans`     | ans      | raw / tar | The raw entropy coder, unsealed.              |
 | `.zst`, `.tar.zst`     | zstd     | raw / tar | Balance of speed and ratio. Multithreaded.    |
 | `.lz4`, `.tar.lz4`     | lz4      | raw / tar | Raw velocity. The fastest blade.              |
 | `.gz`, `.tar.gz`       | gzip     | raw / tar | The old, ubiquitous standard.                 |
@@ -209,6 +240,9 @@ The GUI shares the engine with the CLI exactly; neither knows the other exists.
 | `.tar`                 | store    | tar       | Bundle only. No compression.                  |
 
 Short aliases (`.tgz`, `.tzst`, `.txz`, `.tbz2`) are recognized. Use `--format <name>` to override detection.
+
+Only `.abyss` can be sealed: pass `-p, --password` to encrypt it. `.ans` and
+`.tar.ans` expose the same entropy coder without the container or the seal.
 
 **Single streams** (`.zst`, `.gz`, `.lz4`, `.xz`, `.bz2`, `.br`) compress exactly **one file**. To fold a directory or several files, name a `tar.*` or `.zip` target.
 
@@ -226,6 +260,7 @@ Short aliases (`.tgz`, `.tzst`, `.txz`, `.tbz2`) are recognized. Use `--format <
 | bzip2  | 1 – 9          | 9       |                                         |
 | brotli | 0 – 11         | 6       |                                         |
 | lz4    | —              | —       | Ignores level. It has one speed: fast.  |
+| ans    | —              | —       | Order-0 entropy. No dial — it just folds. |
 
 `-t, --threads` directs `zstd`'s workers. `0` (default) claims every core.
 

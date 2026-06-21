@@ -5,8 +5,11 @@
 //! inversion-of-control API so containers stay codec-agnostic and nothing is
 //! ever buffered in memory in full.
 
+mod abyss;
+mod ans;
 pub mod codec;
 pub mod compress;
+mod crypto;
 pub mod decompress;
 pub mod format;
 pub mod listing;

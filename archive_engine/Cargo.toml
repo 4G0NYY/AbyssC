@@ -23,3 +23,13 @@ xz2 = "0.1"
 bzip2 = "0.4"
 # brotli: web-standard codec (pure Rust)
 brotli = "7"
+
+# --- Encryption for sealed .abyss archives (pure Rust, audited primitives) ---
+# AEAD stream cipher: fast in software, no AES hardware required.
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+# Memory-hard password-based key derivation.
+argon2 = "0.5"
+# OS randomness for per-archive salts and nonces.
+rand = "0.8"
+# Wipe derived keys from memory on drop.
+zeroize = "1"

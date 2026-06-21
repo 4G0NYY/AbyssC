@@ -14,6 +14,9 @@ pub enum Container {
     Tar,
     /// A ZIP archive (compression handled per-entry by the zip crate).
     Zip,
+    /// The sealed `.abyss` form: a tar bundle, ANS-coded, optionally encrypted.
+    /// Like `Zip`, it bundles, compresses, and seals in one pass.
+    Abyss,
 }
 
 /// A fully-resolved archive format.
@@ -51,7 +54,9 @@ impl Format {
             (".tbz", Tar, Bzip2),
             (".tar.lz4", Tar, Lz4),
             (".tar.br", Tar, Brotli),
+            (".tar.ans", Tar, Ans),
             (".tar", Tar, Store),
+            (".abyss", Abyss, Ans),
             (".zip", Zip, Store),
             (".gz", Raw, Gzip),
             (".zst", Raw, Zstd),
@@ -59,6 +64,7 @@ impl Format {
             (".xz", Raw, Xz),
             (".bz2", Raw, Bzip2),
             (".br", Raw, Brotli),
+            (".ans", Raw, Ans),
         ];
         TABLE
             .iter()
@@ -72,6 +78,9 @@ impl Format {
         use Container::*;
         let s = s.trim().to_ascii_lowercase();
         Some(match s.as_str() {
+            "abyss" => Format::new(Abyss, Ans),
+            "ans" => Format::new(Raw, Ans),
+            "tar.ans" => Format::new(Tar, Ans),
             "zip" => Format::new(Zip, Store),
             "tar" => Format::new(Tar, Store),
             "gz" | "gzip" => Format::new(Raw, Gzip),
@@ -94,6 +103,7 @@ impl Format {
     pub fn label(&self) -> String {
         match self.container {
             Container::Zip => "zip".to_string(),
+            Container::Abyss => "abyss".to_string(),
             Container::Raw => self.codec.name().to_string(),
             Container::Tar => match self.codec {
                 Codec::Store => "tar".to_string(),

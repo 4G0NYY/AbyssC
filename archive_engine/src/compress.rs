@@ -4,7 +4,7 @@
 use crate::codec::CodecOptions;
 use crate::format::{Container, Format};
 use crate::progress::{CountWriter, Progress};
-use crate::{util, zip_archive};
+use crate::{abyss, util, zip_archive};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -70,6 +70,7 @@ pub fn compress_with_progress(
 
     match format.container {
         Container::Zip => zip_archive::compress(inputs, dest, opts, progress)?,
+        Container::Abyss => abyss::compress(inputs, dest, progress, opts.password.as_deref())?,
         Container::Raw => {
             if inputs.len() != 1 || inputs[0].is_dir() {
                 return Err(io::Error::new(
@@ -101,7 +102,9 @@ pub fn compress_with_progress(
 
 /// Stream the inputs into a tar archive written to `writer`. Directories are
 /// added recursively; archive paths are kept relative to each input's name.
-fn build_tar(inputs: &[PathBuf], writer: &mut dyn Write) -> io::Result<()> {
+///
+/// Shared by the `Tar` codec path and the `.abyss` container.
+pub(crate) fn build_tar(inputs: &[PathBuf], writer: &mut dyn Write) -> io::Result<()> {
     let mut builder = tar::Builder::new(writer);
     builder.follow_symlinks(false);
 

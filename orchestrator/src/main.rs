@@ -1,4 +1,4 @@
-use archive_engine::{CodecOptions, Format, Report};
+use archive_engine::{CodecOptions, Container, Format, Report};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -41,6 +41,10 @@ enum Commands {
         /// Force a format instead of detecting it from the output extension.
         #[arg(short, long, value_name = "NAME")]
         format: Option<String>,
+        /// Seal the archive with a password (`.abyss` only). Encrypts and
+        /// authenticates the contents; the same password is needed to extract.
+        #[arg(short, long, value_name = "PASSWORD")]
+        password: Option<String>,
         /// Files and/or directories to compress.
         #[arg(required = true)]
         inputs: Vec<PathBuf>,
@@ -57,6 +61,9 @@ enum Commands {
         /// Force a format instead of detecting it from the input extension.
         #[arg(short, long, value_name = "NAME")]
         format: Option<String>,
+        /// Password to unseal an encrypted `.abyss` archive.
+        #[arg(short, long, value_name = "PASSWORD")]
+        password: Option<String>,
     },
     /// List an archive's contents without extracting it.
     #[command(visible_alias = "l")]
@@ -67,6 +74,9 @@ enum Commands {
         /// Force a format instead of detecting it from the input extension.
         #[arg(short, long, value_name = "NAME")]
         format: Option<String>,
+        /// Password to read a sealed `.abyss` archive's contents.
+        #[arg(short, long, value_name = "PASSWORD")]
+        password: Option<String>,
     },
     /// Show the Abyssal field guide: formats, levels, and incantations.
     Help,
@@ -78,13 +88,15 @@ enum Commands {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Commands::Compress { output, level, threads, format, inputs } => {
-            run_compress(&inputs, &output, level, threads, format.as_deref())
+        Commands::Compress { output, level, threads, format, password, inputs } => {
+            run_compress(&inputs, &output, level, threads, format.as_deref(), password)
         }
-        Commands::Extract { input, output, format } => {
-            run_extract(&input, &output, format.as_deref())
+        Commands::Extract { input, output, format, password } => {
+            run_extract(&input, &output, format.as_deref(), password.as_deref())
         }
-        Commands::List { input, format } => run_list(&input, format.as_deref()),
+        Commands::List { input, format, password } => {
+            run_list(&input, format.as_deref(), password.as_deref())
+        }
         Commands::Help => {
             print_guide();
             Ok(())
@@ -110,9 +122,22 @@ fn run_compress(
     level: Option<i32>,
     threads: u32,
     format_override: Option<&str>,
+    password: Option<String>,
 ) -> Result<(), String> {
     let format = resolve_format(format_override, output, "output")?;
-    let opts = CodecOptions::new(level, threads);
+
+    // Encryption is an `.abyss` feature; refuse to silently drop a password the
+    // user clearly meant to apply.
+    if password.as_deref().is_some_and(|p| !p.is_empty())
+        && format.container != Container::Abyss
+    {
+        return Err(format!(
+            "--password only applies to .abyss archives, not '{}'; \
+             use a .abyss output (or -f abyss)",
+            format.label()
+        ));
+    }
+    let opts = CodecOptions::new(level, threads).with_password(password);
 
     println!(
         "Compressing {} item(s) -> {} [{}]",
@@ -130,7 +155,12 @@ fn run_compress(
     Ok(())
 }
 
-fn run_extract(input: &Path, output: &Path, format_override: Option<&str>) -> Result<(), String> {
+fn run_extract(
+    input: &Path,
+    output: &Path,
+    format_override: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), String> {
     let format = resolve_format(format_override, input, "input")?;
 
     println!(
@@ -141,7 +171,7 @@ fn run_extract(input: &Path, output: &Path, format_override: Option<&str>) -> Re
     );
 
     let start = Instant::now();
-    archive_engine::decompress(input, output, format)
+    archive_engine::decompress(input, output, format, password)
         .map_err(|e| format!("extraction failed: {e}"))?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -149,9 +179,13 @@ fn run_extract(input: &Path, output: &Path, format_override: Option<&str>) -> Re
     Ok(())
 }
 
-fn run_list(input: &Path, format_override: Option<&str>) -> Result<(), String> {
+fn run_list(
+    input: &Path,
+    format_override: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), String> {
     let format = resolve_format(format_override, input, "input")?;
-    let listing = archive_engine::list(input, format)
+    let listing = archive_engine::list(input, format, password)
         .map_err(|e| format!("could not read archive: {e}"))?;
 
     println!("Archive: {} [{}]", input.display(), listing.format.label());
@@ -252,7 +286,8 @@ fn print_banner() {
 "#;
     println!("{ART}");
     println!("  AbyssC v{}  —  compression from the depths", env!("CARGO_PKG_VERSION"));
-    println!("  codecs: zstd · lz4 · gzip · xz · bzip2 · brotli · store");
+    println!("  codecs: zstd · lz4 · gzip · xz · bzip2 · brotli · ans · store");
+    println!("  sealed: .abyss  —  our own ANS, optionally encrypted");
     println!();
     println!("  \"It is only natural that those without power have no voice.\"");
 }
@@ -268,8 +303,8 @@ fn print_guide() {
 
  INCANTATIONS
    abyssc compress  -o <archive> [opts] <inputs...>   (alias: c)
-   abyssc extract   -i <archive> [-o <dir>]           (alias: x)
-   abyssc list      -i <archive>                      (alias: l)
+   abyssc extract   -i <archive> [-o <dir>] [-p pw]   (alias: x)
+   abyssc list      -i <archive> [-p pw]              (alias: l)
    abyssc help                                         this guide
    abyssc version                                      the banner (alias: v)
    abyssc <command> --help                             clap's detail
@@ -280,8 +315,11 @@ fn print_guide() {
    -l, --level      effort. higher = smaller, slower. codec-bound.
    -t, --threads    workers (zstd). 0 = every core you have.
    -f, --format     override extension detection (e.g. -f tar.zst)
+   -p, --password   seal/unseal a .abyss archive (encrypted + authenticated)
 
  FORMATS  (extension -> codec)
+   .abyss           ans      our own sigil. bundles, ANS-codes, can be sealed.
+   .ans .tar.ans    ans      the raw entropy coder, unsealed.
    .zst .tar.zst    zstd     balance of speed and ratio. multithreaded.
    .lz4 .tar.lz4    lz4      raw velocity. the fastest blade.
    .gz  .tar.gz     gzip     the old, ubiquitous standard.
@@ -291,15 +329,16 @@ fn print_guide() {
    .zip             zip      portable. deflate per entry.
    .tar             store    bundle only. no compression.
 
-   single-stream (.zst, .gz, ...) take ONE file.
-   tar.* and .zip swallow whole directories.
+   single-stream (.zst, .gz, .ans, ...) take ONE file.
+   tar.*, .zip, and .abyss swallow whole directories.
 
  EFFICIENT PATHS
    abyssc c -o backup.tar.zst project/        bundle a tree, fast
    abyssc c -o data.lz4 data.bin              maximum throughput
    abyssc c -o data.zst -l 19 -t 8 data.bin   maximum compression
+   abyssc c -o vault.abyss -p hunter2 secrets/  seal it from the surface
    abyssc l -i backup.tar.zst                 look without touching
-   abyssc x -i backup.tar.zst -o ./out        unfold it again
+   abyssc x -i vault.abyss -p hunter2 -o ./out  unseal and unfold
 
    "It is only natural that those without power have no voice."
 "#

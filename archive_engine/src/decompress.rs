@@ -3,33 +3,45 @@
 use crate::codec::Codec;
 use crate::format::{Container, Format};
 use crate::progress::{CountReader, Progress};
-use crate::zip_archive;
+use crate::{abyss, zip_archive};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Extract `src` into `out_dir` using `format`.
 ///
-/// - `Zip`/`Tar` archives are unpacked into `out_dir`.
+/// - `Zip`/`Tar`/`Abyss` archives are unpacked into `out_dir`.
 /// - `Raw` streams are decompressed to a single file inside `out_dir`, named by
 ///   stripping the codec's extension from the source file name.
-pub fn decompress(src: &Path, out_dir: &Path, format: Format) -> io::Result<()> {
-    decompress_with_progress(src, out_dir, format, &Progress::new())
+///
+/// `password` is only consulted for a sealed `.abyss` archive; pass `None`
+/// otherwise. An encrypted archive opened with `None` (or a wrong password) is an
+/// error, never a silent failure.
+pub fn decompress(
+    src: &Path,
+    out_dir: &Path,
+    format: Format,
+    password: Option<&str>,
+) -> io::Result<()> {
+    decompress_with_progress(src, out_dir, format, &Progress::new(), password)
 }
 
 /// Like [`decompress`], but reports streaming progress through `progress`.
 ///
-/// For `Raw`/`Tar` the counter tracks **compressed bytes read from the source**
-/// (total = the archive's on-disk size). For `Zip` it tracks **uncompressed
-/// bytes written** (total = the sum of entry sizes), since the zip reader seeks.
+/// For `Raw`/`Tar`/`Abyss` the counter tracks **compressed bytes read from the
+/// source** (total = the archive's on-disk size). For `Zip` it tracks
+/// **uncompressed bytes written** (total = the sum of entry sizes), since the zip
+/// reader seeks.
 pub fn decompress_with_progress(
     src: &Path,
     out_dir: &Path,
     format: Format,
     progress: &Progress,
+    password: Option<&str>,
 ) -> io::Result<()> {
     match format.container {
         Container::Zip => zip_archive::decompress(src, out_dir, progress),
+        Container::Abyss => abyss::decompress(src, out_dir, progress, password),
         Container::Tar => {
             fs::create_dir_all(out_dir)?;
             progress.set_total(fs::metadata(src).map(|m| m.len()).unwrap_or(0));
@@ -63,14 +75,23 @@ pub fn decompress_with_progress(
 /// [`Listing`] (forward-slash separated). For single-stream (`Raw`) formats there
 /// is only ever one member, so `inner` is ignored and the whole stream is written.
 ///
-/// Note that `Tar` is sequential: reaching a member means streaming (and
-/// discarding) everything before it, so the cost scales with the member's
+/// Note that `Tar` and `Abyss` are sequential: reaching a member means streaming
+/// (and discarding) everything before it, so the cost scales with the member's
 /// position, not its size. `Zip` seeks straight to the entry via its index.
-pub fn extract_member(src: &Path, format: Format, inner: &str, dest: &Path) -> io::Result<()> {
+///
+/// `password` is only consulted for a sealed `.abyss` archive.
+pub fn extract_member(
+    src: &Path,
+    format: Format,
+    inner: &str,
+    dest: &Path,
+    password: Option<&str>,
+) -> io::Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     match format.container {
+        Container::Abyss => abyss::extract_member(src, inner, dest, password),
         Container::Raw => {
             let file = File::open(src)?;
             format.codec.decompress(file, |reader| {

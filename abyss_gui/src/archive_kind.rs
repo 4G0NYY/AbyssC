@@ -10,6 +10,7 @@ use std::fmt;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ArchiveKind {
+    Abyss,
     Zstd,
     Lz4,
     Xz,
@@ -21,8 +22,9 @@ pub enum ArchiveKind {
 }
 
 impl ArchiveKind {
-    /// Order shown in the chooser — fastest-balanced first, niche last.
-    pub const ALL: [ArchiveKind; 8] = [
+    /// Order shown in the chooser — our own sealed form first, niche last.
+    pub const ALL: [ArchiveKind; 9] = [
+        ArchiveKind::Abyss,
         ArchiveKind::Zstd,
         ArchiveKind::Lz4,
         ArchiveKind::Xz,
@@ -36,6 +38,7 @@ impl ArchiveKind {
     pub fn format(self) -> Format {
         use ArchiveKind::*;
         match self {
+            Abyss => Format::new(Container::Abyss, Codec::Ans),
             Zstd => Format::new(Container::Tar, Codec::Zstd),
             Lz4 => Format::new(Container::Tar, Codec::Lz4),
             Xz => Format::new(Container::Tar, Codec::Xz),
@@ -51,6 +54,7 @@ impl ArchiveKind {
     pub fn extension(self) -> &'static str {
         use ArchiveKind::*;
         match self {
+            Abyss => ".abyss",
             Zstd => ".tar.zst",
             Lz4 => ".tar.lz4",
             Xz => ".tar.xz",
@@ -60,6 +64,11 @@ impl ArchiveKind {
             Zip => ".zip",
             TarStore => ".tar",
         }
+    }
+
+    /// Whether this form supports password sealing (encryption).
+    pub fn supports_password(self) -> bool {
+        matches!(self, ArchiveKind::Abyss)
     }
 
     /// `(min, max, default)` for the level slider, or `None` if level is ignored.
@@ -72,7 +81,7 @@ impl ArchiveKind {
             Bzip2 => Some((1, 9, 9)),
             Brotli => Some((0, 11, 6)),
             Zip => Some((0, 9, 6)),
-            Lz4 | TarStore => None,
+            Abyss | Lz4 | TarStore => None,
         }
     }
 
@@ -90,6 +99,7 @@ impl ArchiveKind {
     pub fn tagline(self) -> &'static str {
         use ArchiveKind::*;
         match self {
+            Abyss => "Our own ANS sigil. Optionally sealed with a password.",
             Zstd => "Balanced speed and ratio. Claims every core.",
             Lz4 => "Raw velocity. The fastest blade.",
             Xz => "Crushes hardest, moves slowest.",
@@ -104,6 +114,7 @@ impl ArchiveKind {
     fn short(self) -> &'static str {
         use ArchiveKind::*;
         match self {
+            Abyss => "Abyss (sealed)",
             Zstd => "Zstandard",
             Lz4 => "LZ4",
             Xz => "XZ / LZMA",

@@ -254,3 +254,9 @@ Read it plainly: **`lz4`** when speed is everything, **`zst`** for balance (and 
 > *"It is only natural that those without power have no voice."*
 
 AbyssC has no interest in the politics of file formats. It compresses, it extracts, it does so quickly. The rest is surface noise.
+
+---
+
+## 💫 Inspiration & Theming
+
+The terminology, visual palette, and phrasing of AbyssC are inspired by **Skirk**, the enigmatic warrior of the deepest Abyss in *Genshin Impact*. Like her swift, silent containment of the All-Devouring Narwhal, this software exists to compress vast volumes of data down to their absolute essence with quiet efficiency.

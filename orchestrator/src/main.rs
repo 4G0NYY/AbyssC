@@ -70,22 +70,9 @@ enum Commands {
     },
     /// Show the Abyssal field guide: formats, levels, and incantations.
     Help,
-    /// (legacy) Compress a single file into a .zip archive.
-    #[command(hide = true)]
-    Zip {
-        #[arg(short, long)]
-        src: PathBuf,
-        #[arg(short, long)]
-        dest: PathBuf,
-    },
-    /// (legacy) Extract a .zip archive into a directory.
-    #[command(hide = true)]
-    Unzip {
-        #[arg(short, long)]
-        src: PathBuf,
-        #[arg(short, long)]
-        out: PathBuf,
-    },
+    /// Show the version, rendered from the depths.
+    #[command(visible_alias = "v")]
+    Version,
 }
 
 fn main() -> ExitCode {
@@ -102,10 +89,10 @@ fn main() -> ExitCode {
             print_guide();
             Ok(())
         }
-        Commands::Zip { src, dest } => {
-            run_compress(&[src], &dest, None, 0, Some("zip"))
+        Commands::Version => {
+            print_banner();
+            Ok(())
         }
-        Commands::Unzip { src, out } => run_extract(&src, &out, Some("zip")),
     };
 
     match result {
@@ -251,6 +238,25 @@ fn print_report(report: &Report, elapsed: f64) {
     println!("Time: {:.2}s  ({}/s)", elapsed, fmt_bytes(throughput as u64));
 }
 
+/// The themed `version` output: an abyssal banner. Version is pulled from the
+/// crate metadata at compile time, so it always matches `[workspace.package]`.
+fn print_banner() {
+    // Figlet "Standard" rendering of "AbyssC".
+    const ART: &str = r#"
+      _    _                    ____
+     / \  | |__  _   _ ___ ___  / ___|
+    / _ \ | '_ \| | | / __/ __|| |
+   / ___ \| |_) | |_| \__ \__ \| |___
+  /_/   \_\_.__/ \__, |___/___/ \____|
+                 |___/
+"#;
+    println!("{ART}");
+    println!("  AbyssC v{}  —  compression from the depths", env!("CARGO_PKG_VERSION"));
+    println!("  codecs: zstd · lz4 · gzip · xz · bzip2 · brotli · store");
+    println!();
+    println!("  \"It is only natural that those without power have no voice.\"");
+}
+
 /// The themed `help` output: a blunt, efficient field guide.
 fn print_guide() {
     println!(
@@ -265,6 +271,7 @@ fn print_guide() {
    abyssc extract   -i <archive> [-o <dir>]           (alias: x)
    abyssc list      -i <archive>                      (alias: l)
    abyssc help                                         this guide
+   abyssc version                                      the banner (alias: v)
    abyssc <command> --help                             clap's detail
 
  OPTIONS

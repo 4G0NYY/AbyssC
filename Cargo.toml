@@ -5,3 +5,9 @@ members = [
 ]
 resolver = "2"
 
+# Single source of truth for metadata shared by every crate in the workspace.
+# Member crates opt in with `version.workspace = true`, etc.
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+authors = ["4G0NYY"]

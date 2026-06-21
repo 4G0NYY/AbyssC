@@ -74,6 +74,7 @@ abyssc compress  -o <archive> [opts] <inputs...>   (alias: c)
 abyssc extract   -i <archive> [-o <dir>]           (alias: x)
 abyssc list      -i <archive>                      (alias: l)
 abyssc help                                         the field guide
+abyssc version                                      the banner (alias: v)
 abyssc <command> --help                             precise detail
 ```
 
@@ -111,6 +112,25 @@ Archive: backup.tar.zst [tar.zstd]
       5.86 KiB  project/README
   2 file(s), 1 dir(s), 5.87 KiB uncompressed
 ```
+
+### Version
+
+```sh
+abyssc version    # or: abyssc v
+```
+
+```
+      _    _                    ____
+     / \  | |__  _   _ ___ ___  / ___|
+    / _ \ | '_ \| | | / __/ __|| |
+   / ___ \| |_) | |_| \__ \__ \| |___
+  /_/   \_\_.__/ \__, |___/___/ \____|
+                 |___/
+
+  AbyssC v0.3.0  —  compression from the depths
+```
+
+The version is declared once, in the workspace root (`[workspace.package]`), and inherited by every crate — so the banner, `-V`, and the crate metadata can never drift apart.
 
 ---
 
@@ -165,19 +185,6 @@ Short aliases (`.tgz`, `.tzst`, `.txz`, `.tbz2`) are recognized. Use `--format <
 | `bz2`  | 4.8 %  | ~6 MB/s      |
 
 Read it plainly: **`lz4`** when speed is everything, **`zst`** for balance (and far better ratio at higher levels), **`xz`** when you have time and want the bytes gone.
-
----
-
-## 🕯️ Legacy
-
-The first incantations still answer, hidden but intact:
-
-```sh
-abyssc zip   -s file.txt -d archive.zip
-abyssc unzip -s archive.zip -o ./out
-```
-
-They are thin shells over `compress`/`extract`. Prefer the new forms.
 
 ---
 

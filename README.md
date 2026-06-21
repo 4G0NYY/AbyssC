@@ -44,8 +44,9 @@ The engine does not tangle its concerns. An **archive format** is the union of t
   - `zip_archive.rs` — the `zip` path, which bundles and compresses in one pass.
   - `listing.rs` — reads an archive's table of contents.
 - **`orchestrator`** — the hand that gestures. A thin CLI (`abyssc`) that resolves a format and calls the core.
+- **`abyss_gui`** — the same hand, made visible. A sleek windowed front-end (`abyssc-gui`), peer to the CLI, that calls the very same core.
 
-Adding a codec touches one file and one detection table. The rest of the engine does not stir.
+Adding a codec touches one file and one detection table. The rest of the engine does not stir. A new front-end adds a crate and touches nothing else — the GUI did not change a single line of the engine's logic, only *observed* it through a thread-safe `Progress` counter.
 
 ---
 
@@ -59,10 +60,12 @@ cd AbyssC
 cargo build --release
 ```
 
-The blade is forged at `target/release/abyssc` (`abyssc.exe` on Windows).
+The blade is forged at `target/release/abyssc` (`abyssc.exe` on Windows), and the
+window at `target/release/abyssc-gui`.
 
 ```sh
-cargo test --release   # round-trip every format, byte-for-byte
+cargo test --release           # round-trip every format, byte-for-byte
+cargo run --release -p abyss_gui   # open the window
 ```
 
 ---
@@ -131,6 +134,30 @@ abyssc version    # or: abyssc v
 ```
 
 The version is declared once, in the workspace root (`[workspace.package]`), and inherited by every crate — so the banner, `-V`, and the crate metadata can never drift apart.
+
+---
+
+## 🪟 Visage — The Window
+
+For those who prefer to gesture rather than incant, there is `abyssc-gui` — a
+sleek, dark, **Abyssal** desktop application, built on [Iced](https://iced.rs):
+pure Rust, GPU-rendered, **no webview**. It follows WinRAR's familiar shape and
+strips away its clutter.
+
+```sh
+cargo run --release -p abyss_gui
+```
+
+- **Two modes.** *Compress* (gather sources, choose a form, fold them) and
+  *Extract* (open an archive, peer inside, unfold it).
+- **Drag the world in.** Drop files and folders straight onto the window.
+- **It never freezes.** The engine crunches on a worker thread while the window
+  stays fluid; a live bar reflects a lock-free `Progress` counter polled from the
+  UI. A 100 GB fold draws at the same frame rate as a 100 KB one.
+- **One palette.** Frost-cyan and abyssal violet on near-black — Skirk's colors,
+  not a surface dweller's.
+
+The GUI shares the engine with the CLI exactly; neither knows the other exists.
 
 ---
 

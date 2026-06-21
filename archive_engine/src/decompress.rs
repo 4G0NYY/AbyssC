@@ -2,6 +2,7 @@
 
 use crate::codec::Codec;
 use crate::format::{Container, Format};
+use crate::progress::{CountReader, Progress};
 use crate::zip_archive;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -13,11 +14,26 @@ use std::path::{Path, PathBuf};
 /// - `Raw` streams are decompressed to a single file inside `out_dir`, named by
 ///   stripping the codec's extension from the source file name.
 pub fn decompress(src: &Path, out_dir: &Path, format: Format) -> io::Result<()> {
+    decompress_with_progress(src, out_dir, format, &Progress::new())
+}
+
+/// Like [`decompress`], but reports streaming progress through `progress`.
+///
+/// For `Raw`/`Tar` the counter tracks **compressed bytes read from the source**
+/// (total = the archive's on-disk size). For `Zip` it tracks **uncompressed
+/// bytes written** (total = the sum of entry sizes), since the zip reader seeks.
+pub fn decompress_with_progress(
+    src: &Path,
+    out_dir: &Path,
+    format: Format,
+    progress: &Progress,
+) -> io::Result<()> {
     match format.container {
-        Container::Zip => zip_archive::decompress(src, out_dir),
+        Container::Zip => zip_archive::decompress(src, out_dir, progress),
         Container::Tar => {
             fs::create_dir_all(out_dir)?;
-            let file = File::open(src)?;
+            progress.set_total(fs::metadata(src).map(|m| m.len()).unwrap_or(0));
+            let file = CountReader::new(File::open(src)?, progress);
             format.codec.decompress(file, |reader| {
                 let mut archive = tar::Archive::new(reader);
                 archive.unpack(out_dir)?;
@@ -26,8 +42,9 @@ pub fn decompress(src: &Path, out_dir: &Path, format: Format) -> io::Result<()> 
         }
         Container::Raw => {
             fs::create_dir_all(out_dir)?;
+            progress.set_total(fs::metadata(src).map(|m| m.len()).unwrap_or(0));
             let target = out_dir.join(raw_output_name(src, format.codec));
-            let file = File::open(src)?;
+            let file = CountReader::new(File::open(src)?, progress);
             format.codec.decompress(file, |reader| {
                 let mut out = BufWriter::with_capacity(1 << 20, File::create(&target)?);
                 io::copy(reader, &mut out)?;

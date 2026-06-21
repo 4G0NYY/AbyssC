@@ -3,6 +3,7 @@
 
 use crate::codec::CodecOptions;
 use crate::format::{Container, Format};
+use crate::progress::{CountWriter, Progress};
 use crate::{util, zip_archive};
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
@@ -38,6 +39,20 @@ pub fn compress(
     format: Format,
     opts: &CodecOptions,
 ) -> io::Result<Report> {
+    compress_with_progress(inputs, dest, format, opts, &Progress::new())
+}
+
+/// Like [`compress`], but reports streaming progress through `progress`.
+///
+/// `progress` tracks **uncompressed input bytes consumed**, against a total of
+/// [`util::total_size`]. Intended to be polled from another thread.
+pub fn compress_with_progress(
+    inputs: &[PathBuf],
+    dest: &Path,
+    format: Format,
+    opts: &CodecOptions,
+    progress: &Progress,
+) -> io::Result<Report> {
     if inputs.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no input paths given"));
     }
@@ -51,9 +66,10 @@ pub fn compress(
     }
 
     let uncompressed = util::total_size(inputs);
+    progress.set_total(uncompressed);
 
     match format.container {
-        Container::Zip => zip_archive::compress(inputs, dest, opts)?,
+        Container::Zip => zip_archive::compress(inputs, dest, opts, progress)?,
         Container::Raw => {
             if inputs.len() != 1 || inputs[0].is_dir() {
                 return Err(io::Error::new(
@@ -65,13 +81,17 @@ pub fn compress(
             let mut src = BufReader::with_capacity(1 << 20, File::open(&inputs[0])?);
             let out = File::create(dest)?;
             format.codec.compress(out, opts, |w| {
-                io::copy(&mut src, w)?;
+                let mut counted = CountWriter::new(w, progress);
+                io::copy(&mut src, &mut counted)?;
                 Ok(())
             })?;
         }
         Container::Tar => {
             let out = File::create(dest)?;
-            format.codec.compress(out, opts, |w| build_tar(inputs, w))?;
+            format.codec.compress(out, opts, |w| {
+                let mut counted = CountWriter::new(w, progress);
+                build_tar(inputs, &mut counted)
+            })?;
         }
     }
 

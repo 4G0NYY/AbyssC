@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "orchestrator",
-    "archive_engine"
+    "archive_engine",
+    "abyss_gui"
 ]
 resolver = "2"
 

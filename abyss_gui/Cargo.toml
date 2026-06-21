@@ -1,0 +1,18 @@
+[package]
+name = "abyss_gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+archive_engine = { path = "../archive_engine" }
+# Pure-Rust, GPU-rendered GUI (no webview). 0.13 = the established functional API.
+# "tokio" gives us `time::every` for polling progress off the worker thread.
+iced = { version = "0.13", features = ["tokio"] }
+# Native OS file/folder dialogs (no webview).
+rfd = "0.15"
+
+# A windowed app, not a console one. `abyssc-gui` is the user-facing name.
+[[bin]]
+name = "abyssc-gui"
+path = "src/main.rs"

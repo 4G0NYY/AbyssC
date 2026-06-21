@@ -60,7 +60,7 @@ Adding a codec touches one file and one detection table. The rest of the engine 
 Requires a Rust toolchain (edition 2024; Rust 1.85+). On Windows, the native codecs (`zstd`, `xz`, `bzip2`) compile bundled C through MSVC — install the **VC++ Build Tools**.
 
 ```sh
-git clone <this-repo> AbyssC
+git clone https://github.com/4G0NYY/AbyssC.git
 cd AbyssC
 cargo build --release
 ```

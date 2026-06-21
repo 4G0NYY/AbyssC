@@ -5,7 +5,7 @@ use crate::format::{Container, Format};
 use crate::progress::{CountReader, Progress};
 use crate::zip_archive;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// Extract `src` into `out_dir` using `format`.
@@ -53,6 +53,91 @@ pub fn decompress_with_progress(
             })
         }
     }
+}
+
+/// Extract a single member from `src` to the file path `dest`, decompressing
+/// only that one entry — the trick that lets the GUI open a file straight out of
+/// an archive without unpacking the whole thing.
+///
+/// `inner` is the member's archive-internal path exactly as it appears in a
+/// [`Listing`] (forward-slash separated). For single-stream (`Raw`) formats there
+/// is only ever one member, so `inner` is ignored and the whole stream is written.
+///
+/// Note that `Tar` is sequential: reaching a member means streaming (and
+/// discarding) everything before it, so the cost scales with the member's
+/// position, not its size. `Zip` seeks straight to the entry via its index.
+pub fn extract_member(src: &Path, format: Format, inner: &str, dest: &Path) -> io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    match format.container {
+        Container::Raw => {
+            let file = File::open(src)?;
+            format.codec.decompress(file, |reader| {
+                let mut out = BufWriter::with_capacity(1 << 20, File::create(dest)?);
+                io::copy(reader, &mut out)?;
+                out.flush()?;
+                Ok(())
+            })
+        }
+        Container::Tar => {
+            let want = normalize_member(inner);
+            let file = File::open(src)?;
+            let mut found = false;
+            format.codec.decompress(file, |reader| {
+                let mut archive = tar::Archive::new(reader);
+                for entry in archive.entries()? {
+                    let mut entry = entry?;
+                    let name = normalize_member(&entry.path()?.to_string_lossy());
+                    if name == want {
+                        let mut out = BufWriter::with_capacity(1 << 20, File::create(dest)?);
+                        io::copy(&mut entry, &mut out)?;
+                        out.flush()?;
+                        found = true;
+                        break;
+                    }
+                }
+                Ok(())
+            })?;
+            if !found {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such member in archive: {inner}"),
+                ));
+            }
+            Ok(())
+        }
+        Container::Zip => {
+            let want = normalize_member(inner);
+            let file = BufReader::new(File::open(src)?);
+            let mut archive = zip::ZipArchive::new(file)?;
+            let mut index = None;
+            for i in 0..archive.len() {
+                let entry = archive.by_index(i)?;
+                if normalize_member(entry.name()) == want {
+                    index = Some(i);
+                    break;
+                }
+            }
+            let i = index.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such member in archive: {inner}"),
+                )
+            })?;
+            let mut entry = archive.by_index(i)?;
+            let mut out = BufWriter::with_capacity(1 << 20, File::create(dest)?);
+            io::copy(&mut entry, &mut out)?;
+            out.flush()?;
+            Ok(())
+        }
+    }
+}
+
+/// Canonicalize an archive-internal path for comparison: forward slashes, no
+/// trailing slash. Tar paths can arrive with platform separators; this levels them.
+fn normalize_member(name: &str) -> String {
+    name.replace('\\', "/").trim_end_matches('/').to_string()
 }
 
 /// Derive the decompressed file name for a raw stream by stripping the codec's

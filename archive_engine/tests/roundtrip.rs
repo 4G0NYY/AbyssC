@@ -88,6 +88,45 @@ fn check_container(format_name: &str, archive_name: &str) {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// Pull one nested member out of a container without unpacking the rest.
+fn check_extract_member(format_name: &str, archive_name: &str) {
+    let dir = unique_dir(format_name);
+    let payload = sample_payload();
+
+    let tree = dir.join("tree");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    fs::write(tree.join("a.txt"), b"hello from a").unwrap();
+    fs::write(tree.join("sub/b.bin"), &payload).unwrap();
+
+    let archive = dir.join(archive_name);
+    let format = Format::from_path(&archive).expect("extension should map to a format");
+    archive_engine::compress(&[tree.clone()], &archive, format, &CodecOptions::default())
+        .unwrap_or_else(|e| panic!("compress {format_name} failed: {e}"));
+
+    // A deeply-nested member, drawn out on its own.
+    let one = dir.join("just_b.bin");
+    archive_engine::extract_member(&archive, format, "tree/sub/b.bin", &one)
+        .unwrap_or_else(|e| panic!("extract_member {format_name} failed: {e}"));
+    assert_eq!(fs::read(&one).unwrap(), payload, "{format_name}: member mismatch");
+
+    // A missing member is an error, not a silent empty file.
+    let missing = dir.join("nope");
+    assert!(
+        archive_engine::extract_member(&archive, format, "tree/ghost", &missing).is_err(),
+        "{format_name}: missing member should error"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn extract_member_pulls_one_file() {
+    check_extract_member("tar", "tree.tar");
+    check_extract_member("tar.zst", "tree.tar.zst");
+    check_extract_member("tar.gz", "tree.tar.gz");
+    check_extract_member("zip", "tree.zip");
+}
+
 #[test]
 fn raw_streams_roundtrip() {
     check_raw("gzip", ".gz");

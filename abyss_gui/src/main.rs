@@ -25,7 +25,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Size, Subscription, Task};
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -142,6 +142,9 @@ enum Status {
 struct Job {
     progress: Arc<Progress>,
     outcome: Arc<Mutex<Option<Result<String, String>>>>,
+    /// When the job began — drives the "sealing" phase timer once input is
+    /// fully consumed but the codec is still finalizing.
+    started: Instant,
 }
 
 struct Abyss {
@@ -166,6 +169,10 @@ struct Abyss {
     rows: Vec<BrowseRow>,
     selected: Option<usize>,
     browse_error: Option<String>,
+    /// Name of a member currently being drawn out of an archive to open.
+    opening: Option<String>,
+    /// Last activated row + when, for detecting a double-click to open.
+    last_click: Option<(usize, Instant)>,
 
     // Shared.
     job: Option<Job>,
@@ -198,6 +205,8 @@ impl Abyss {
             rows,
             selected: None,
             browse_error: None,
+            opening: None,
+            last_click: None,
             job: None,
             status: Status::Idle,
             fraction: 0.0,
@@ -244,6 +253,8 @@ enum Message {
     // Compress.
     AddFiles,
     AddFolder,
+    FilesPicked(Vec<PathBuf>),
+    FolderPicked(Option<PathBuf>),
     RemoveInput(usize),
     ClearInputs,
     KindSelected(ArchiveKind),
@@ -251,10 +262,13 @@ enum Message {
     ThreadsChanged(i32),
     OutputEdited(String),
     BrowseOutput,
+    OutputChosen(Option<PathBuf>),
 
     // Extract.
     OpenArchive,
+    ArchivePicked(Option<PathBuf>),
     ChooseDest,
+    DestPicked(Option<PathBuf>),
 
     // Browse / Commander.
     BrowseActivate(usize),
@@ -268,6 +282,8 @@ enum Message {
     Start,
     Tick,
     FileDropped(PathBuf),
+    /// An archive member finished extracting and was handed to the OS to open.
+    FileOpened(Result<(), String>),
 
     // Update prompt.
     UpdateChecked(Option<UpdateInfo>),
@@ -292,12 +308,35 @@ impl Abyss {
             }
 
             Message::AddFiles => {
-                if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_files()
+                            .await
+                            .map(|handles| handles.iter().map(|h| h.path().to_path_buf()).collect())
+                            .unwrap_or_default()
+                    },
+                    Message::FilesPicked,
+                );
+            }
+            Message::FilesPicked(paths) => {
+                if !paths.is_empty() {
                     self.add_inputs(paths);
                 }
             }
             Message::AddFolder => {
-                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::FolderPicked,
+                );
+            }
+            Message::FolderPicked(path) => {
+                if let Some(path) = path {
                     self.add_inputs(vec![path]);
                 }
             }
@@ -328,37 +367,83 @@ impl Abyss {
                 self.output = if s.trim().is_empty() { None } else { Some(PathBuf::from(s)) };
             }
             Message::BrowseOutput => {
-                let mut dialog = rfd::FileDialog::new().set_file_name(self.suggested_file_name());
-                if let Some(dir) = self.inputs.first().and_then(|p| p.parent()) {
-                    dialog = dialog.set_directory(dir);
-                }
-                if let Some(path) = dialog.save_file() {
+                let name = self.suggested_file_name();
+                let dir = self.inputs.first().and_then(|p| p.parent()).map(PathBuf::from);
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new().set_file_name(name);
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.save_file().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::OutputChosen,
+                );
+            }
+            Message::OutputChosen(path) => {
+                if let Some(path) = path {
                     self.output = Some(path);
                     self.output_is_auto = false;
                 }
             }
 
             Message::OpenArchive => {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                return Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_file()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::ArchivePicked,
+                );
+            }
+            Message::ArchivePicked(path) => {
+                if let Some(path) = path {
                     self.load_archive(path);
                 }
             }
             Message::ChooseDest => {
-                let mut dialog = rfd::FileDialog::new();
-                if let Some(dir) = self.archive.as_ref().and_then(|p| p.parent()) {
-                    dialog = dialog.set_directory(dir);
-                }
-                if let Some(path) = dialog.pick_folder() {
+                let dir = self.archive.as_ref().and_then(|p| p.parent()).map(PathBuf::from);
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new();
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.pick_folder().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::DestPicked,
+                );
+            }
+            Message::DestPicked(path) => {
+                if let Some(path) = path {
                     self.dest = Some(path);
                 }
             }
 
             Message::BrowseActivate(i) => {
+                let now = Instant::now();
+                let double = matches!(
+                    self.last_click,
+                    Some((j, t)) if j == i && now.duration_since(t) < Duration::from_millis(450)
+                );
+                self.last_click = Some((i, now));
+
                 if let Some(row) = self.rows.get(i).cloned() {
-                    match browser::activate(&self.location, &row) {
-                        Activated::Go(loc) => self.set_location(loc),
-                        Activated::Stay => self.selected = Some(i),
-                        Activated::Error(e) => self.browse_error = Some(e),
+                    // Files don't navigate: a single click selects, a double click
+                    // opens. Folders/archives/drives keep their one-click behavior.
+                    if row.kind == RowKind::File {
+                        self.selected = Some(i);
+                        if double {
+                            return self.open_file_row(&row);
+                        }
+                    } else {
+                        match browser::activate(&self.location, &row) {
+                            Activated::Go(loc) => self.set_location(loc),
+                            Activated::Stay => self.selected = Some(i),
+                            Activated::Error(e) => self.browse_error = Some(e),
+                        }
                     }
                 }
             }
@@ -394,6 +479,12 @@ impl Abyss {
                 Mode::Extract => self.load_archive(path),
                 Mode::Browse => self.navigate_to_dropped(path),
             },
+            Message::FileOpened(result) => {
+                self.opening = None;
+                if let Err(e) = result {
+                    self.browse_error = Some(e);
+                }
+            }
 
             Message::PollExternal => {
                 let drained: Vec<PathBuf> = match self.incoming.lock() {
@@ -534,6 +625,50 @@ impl Abyss {
         }
     }
 
+    /// Open an activated file row. A file on disk is handed straight to the OS;
+    /// a file inside an archive is drawn out to a temp file (just that one member)
+    /// on a worker thread, then opened — the archive is never fully unpacked.
+    fn open_file_row(&mut self, row: &BrowseRow) -> Task<Message> {
+        match &self.location {
+            Location::Fs(dir) => {
+                open_path(&dir.join(&row.name));
+                Task::none()
+            }
+            Location::Archive { path, format, inner, .. } => {
+                let src = path.clone();
+                let format = *format;
+                let member = format!("{inner}{}", row.name);
+                let name = row.name.clone();
+                self.opening = Some(name.clone());
+                self.browse_error = None;
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || open_archive_member(&src, format, &member, &name))
+                            .await
+                            .unwrap_or_else(|e| Err(e.to_string()))
+                    },
+                    Message::FileOpened,
+                )
+            }
+            Location::Drives => Task::none(),
+        }
+    }
+
+    /// The output path with the format's extension enforced. If the user typed a
+    /// bare or wrong-suffixed name (e.g. `test` while ZSTD is selected), it gains
+    /// the dropdown's extension; a bare name is anchored to the source folder.
+    fn finalized_output(&self) -> Option<PathBuf> {
+        let raw = self.output.as_ref()?;
+        let fixed = reext(raw, self.kind.extension());
+        let bare = fixed.parent().is_none_or(|p| p.as_os_str().is_empty());
+        if let (true, Some(name), Some(dir)) =
+            (bare, fixed.file_name(), self.inputs.first().and_then(|p| p.parent()))
+        {
+            return Some(dir.join(name));
+        }
+        Some(fixed)
+    }
+
     fn ready(&self) -> bool {
         if self.busy() {
             return false;
@@ -550,6 +685,11 @@ impl Abyss {
     fn start_job(&mut self) {
         if !self.ready() {
             return;
+        }
+        // Lock in a well-formed output name before we hand it to the engine, so
+        // a stripped or mistyped extension can't yield a name-less archive.
+        if self.mode == Mode::Compress && let Some(fixed) = self.finalized_output() {
+            self.output = Some(fixed);
         }
         let progress = Arc::new(Progress::new());
         let outcome: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
@@ -605,7 +745,7 @@ impl Abyss {
             Mode::Browse => return,
         }
 
-        self.job = Some(Job { progress, outcome });
+        self.job = Some(Job { progress, outcome, started: Instant::now() });
         self.status = Status::Running;
         self.fraction = 0.0;
     }
@@ -1112,7 +1252,9 @@ impl Abyss {
     }
 
     fn browse_status(&self) -> Element<'_, Message> {
-        let (msg, color) = if let Some(err) = &self.browse_error {
+        let (msg, color) = if let Some(name) = &self.opening {
+            (format!("◓  Drawing “{name}” from the depths — it will open shortly…"), theme::CYAN)
+        } else if let Some(err) = &self.browse_error {
             (err.clone(), theme::RED)
         } else if let Some(path) = self.selected_fs_path() {
             (path.display().to_string(), theme::TEXT)
@@ -1138,8 +1280,24 @@ impl Abyss {
             return self.browse_status();
         }
 
+        // "Sealing": every input byte is in, but the codec is still finalizing
+        // (zstd at high effort can grind here for a long time). Without this the
+        // bar would just sit at 100% and look hung.
+        let sealing = self.busy() && self.fraction >= 1.0;
+        let elapsed = self.job.as_ref().map(|j| j.started.elapsed()).unwrap_or_default();
+
         let (msg, msg_color): (String, _) = match &self.status {
             Status::Idle => (self.idle_hint(), theme::MUTED),
+            Status::Running if sealing => {
+                const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
+                let frame = SPIN[(elapsed.as_millis() / 120 % SPIN.len() as u128) as usize];
+                let phase = match self.mode {
+                    Mode::Compress => "Sealing the orb — crushing the final depths",
+                    Mode::Extract => "Drawing up the last of it",
+                    Mode::Browse => "",
+                };
+                (format!("{frame}  {phase}…  ·  {:.0}s", elapsed.as_secs_f64()), theme::CYAN)
+            }
             Status::Running => (
                 format!(
                     "{} from the depths… {:.0}%",
@@ -1168,8 +1326,16 @@ impl Abyss {
 
         let mut band = column![].spacing(10);
         if self.busy() || matches!(self.status, Status::Done(_)) {
+            // While sealing, sweep the bar back and forth so it reads as "busy"
+            // rather than a frozen 100%.
+            let bar_value = if sealing {
+                let t = (elapsed.as_millis() % 1400) as f32 / 1400.0;
+                1.0 - (2.0 * t - 1.0).abs()
+            } else {
+                self.fraction
+            };
             band = band.push(
-                progress_bar(0.0..=1.0, self.fraction)
+                progress_bar(0.0..=1.0, bar_value)
                     .height(Length::Fixed(8.0))
                     .style(theme::progress),
             );
@@ -1245,6 +1411,35 @@ fn dir_size(path: &std::path::Path) -> u64 {
 
 fn available_cores() -> i32 {
     std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(1)
+}
+
+/// Draw a single member out of an archive into a private temp folder and hand it
+/// to the OS to open with the user's default app — no full extraction. Runs on a
+/// blocking worker thread.
+fn open_archive_member(src: &Path, format: Format, member: &str, name: &str) -> Result<(), String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dest = std::env::temp_dir().join("AbyssC").join(stamp.to_string()).join(name);
+    archive_engine::extract_member(src, format, member, &dest).map_err(|e| e.to_string())?;
+    open_path(&dest);
+    Ok(())
+}
+
+/// Open a filesystem path with the OS default handler.
+fn open_path(path: &Path) {
+    #[cfg(windows)]
+    {
+        // `start` is a cmd builtin; the empty "" is its (ignored) window title.
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", &path.to_string_lossy()])
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
 }
 
 /// Open a URL in the user's default browser.

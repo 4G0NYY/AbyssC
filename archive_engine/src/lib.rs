@@ -16,7 +16,7 @@ mod zip_archive;
 
 pub use codec::{Codec, CodecOptions};
 pub use compress::{Report, compress, compress_with_progress};
-pub use decompress::{decompress, decompress_with_progress};
+pub use decompress::{decompress, decompress_with_progress, extract_member};
 pub use format::{Container, Format};
 pub use listing::{Entry, Listing, list};
 pub use progress::Progress;

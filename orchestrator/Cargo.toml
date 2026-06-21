@@ -7,3 +7,8 @@ edition = "2024"
 archive_engine = { path = "../archive_engine" }
 # For beautiful CLI parsing
 clap = { version = "4.6.1", features = ["derive"] }
+
+# The user-facing command is `abyssc`, not the crate name.
+[[bin]]
+name = "abyssc"
+path = "src/main.rs"

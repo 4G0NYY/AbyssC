@@ -1,0 +1,188 @@
+# 🌌 AbyssC
+
+> *She compressed the massive, world-threatening All-Devouring Narwhal into a tiny, glowing orb with a simple gesture of her hand.*
+
+**AbyssC** — *AbyssCompress* — is a performance-first, modular compression engine written entirely in Rust. It takes what the surface struggles to hold and folds it down to something smaller. Space is not sacred here; it is merely something to be condensed.
+
+The surface measures archives by familiarity. The Abyss measures them by **power** — throughput, and the ratio of what remains. That is the only metric that matters.
+
+---
+
+## ⚔️ Power
+
+One command, many codecs. The format is chosen by the extension you name — nothing more is asked of you.
+
+- **Seven codecs.** `zstd`, `lz4`, `gzip`, `xz`, `bzip2`, `brotli`, and raw `store`.
+- **Three containers.** A single compressed stream, a `tar` bundle, or a portable `zip`.
+- **Streaming by nature.** Bytes flow through 1 MiB buffers. Nothing is held whole in memory — a 100 GB file costs the same RAM as a 100 KB one.
+- **Multithreaded `zstd`.** It claims every core you give it, or as many as you permit.
+- **Whole directories.** `tar.*` and `.zip` swallow entire trees. The single streams take one file, as is their nature.
+- **Inspect without touching.** List an archive's contents without unfolding it.
+
+---
+
+## 🏛️ Lineage — Architecture
+
+The engine does not tangle its concerns. An **archive format** is the union of two independent ideas:
+
+```
+            Format
+          ╱        ╲
+   Container        Codec
+   (layout)         (compression)
+   ┌─────────┐      ┌──────────────────────────────────┐
+   │  Raw    │      │ Store · Gzip · Zstd · Lz4 ·       │
+   │  Tar    │  ×   │ Xz · Bzip2 · Brotli              │
+   │  Zip    │      └──────────────────────────────────┘
+   └─────────┘
+```
+
+- **`archive_engine`** — the disciplined core. A library, no voice of its own.
+  - `codec.rs` — every algorithm behind one inversion-of-control API. Each codec wraps a stream and handles its own finalization. The container layer never learns their secrets.
+  - `format.rs` — `Format = Container + Codec`, with extension detection.
+  - `compress.rs` / `decompress.rs` — dispatch over `Raw`, `Tar`, `Zip`.
+  - `zip_archive.rs` — the `zip` path, which bundles and compresses in one pass.
+  - `listing.rs` — reads an archive's table of contents.
+- **`orchestrator`** — the hand that gestures. A thin CLI (`abyssc`) that resolves a format and calls the core.
+
+Adding a codec touches one file and one detection table. The rest of the engine does not stir.
+
+---
+
+## 🜂 Summoning — Build
+
+Requires a Rust toolchain (edition 2024; Rust 1.85+). On Windows, the native codecs (`zstd`, `xz`, `bzip2`) compile bundled C through MSVC — install the **VC++ Build Tools**.
+
+```sh
+git clone <this-repo> AbyssC
+cd AbyssC
+cargo build --release
+```
+
+The blade is forged at `target/release/abyssc` (`abyssc.exe` on Windows).
+
+```sh
+cargo test --release   # round-trip every format, byte-for-byte
+```
+
+---
+
+## 🔮 Incantations — Usage
+
+```
+abyssc compress  -o <archive> [opts] <inputs...>   (alias: c)
+abyssc extract   -i <archive> [-o <dir>]           (alias: x)
+abyssc list      -i <archive>                      (alias: l)
+abyssc help                                         the field guide
+abyssc <command> --help                             precise detail
+```
+
+### Compress
+
+The output extension decides the format. Speak the name; the engine understands.
+
+```sh
+abyssc compress -o backup.tar.zst  project/ notes.txt   # bundle a tree → zstd
+abyssc compress -o data.lz4        data.bin             # raw velocity
+abyssc compress -o data.zst -l 19 -t 8  data.bin        # crush it, eight cores
+abyssc compress -o site.tar.br     www/                 # brotli a directory
+```
+
+### Extract
+
+```sh
+abyssc extract -i backup.tar.zst -o ./restored
+abyssc extract -i data.lz4                       # → ./data  (name derived from archive)
+```
+
+### List
+
+Look into the orb without breaking it open.
+
+```sh
+abyssc list -i backup.tar.zst
+```
+
+```
+Archive: backup.tar.zst [tar.zstd]
+          SIZE  NAME
+         <dir>  project/
+          13 B  project/src/main.rs
+      5.86 KiB  project/README
+  2 file(s), 1 dir(s), 5.87 KiB uncompressed
+```
+
+---
+
+## 📜 Forms — Formats
+
+| Extension              | Codec    | Container | Disposition                                   |
+| ---------------------- | -------- | --------- | --------------------------------------------- |
+| `.zst`, `.tar.zst`     | zstd     | raw / tar | Balance of speed and ratio. Multithreaded.    |
+| `.lz4`, `.tar.lz4`     | lz4      | raw / tar | Raw velocity. The fastest blade.              |
+| `.gz`, `.tar.gz`       | gzip     | raw / tar | The old, ubiquitous standard.                 |
+| `.xz`, `.tar.xz`       | xz/lzma  | raw / tar | Patient. Crushes hardest, moves slowest.      |
+| `.bz2`, `.tar.bz2`     | bzip2    | raw / tar | Legacy weight.                                |
+| `.br`, `.tar.br`       | brotli   | raw / tar | The web's chosen ratio.                       |
+| `.zip`                 | deflate  | zip       | Portable. Compresses per entry.               |
+| `.tar`                 | store    | tar       | Bundle only. No compression.                  |
+
+Short aliases (`.tgz`, `.tzst`, `.txz`, `.tbz2`) are recognized. Use `--format <name>` to override detection.
+
+**Single streams** (`.zst`, `.gz`, `.lz4`, `.xz`, `.bz2`, `.br`) compress exactly **one file**. To fold a directory or several files, name a `tar.*` or `.zip` target.
+
+---
+
+## 🎚️ Effort — Levels
+
+`-l, --level` sets effort: higher means smaller and slower. Each codec keeps its own scale; the value is clamped to what it understands, so one flag serves all.
+
+| Codec  | Range          | Default | Notes                                   |
+| ------ | -------------- | ------- | --------------------------------------- |
+| zstd   | 1 – 22         | 3       | `-l 19`+ for serious ratio.             |
+| gzip   | 0 – 9          | 6       |                                         |
+| xz     | 0 – 9          | 6       |                                         |
+| bzip2  | 1 – 9          | 9       |                                         |
+| brotli | 0 – 11         | 6       |                                         |
+| lz4    | —              | —       | Ignores level. It has one speed: fast.  |
+
+`-t, --threads` directs `zstd`'s workers. `0` (default) claims every core.
+
+---
+
+## 📊 Measured Power
+
+50 MB of mixed compressible/incompressible data, default levels, one machine. *Your depths will differ.*
+
+| Format | Ratio  | Throughput   |
+| ------ | ------ | ------------ |
+| `lz4`  | 5.1 %  | ~1600 MB/s   |
+| `gz`   | 5.4 %  | ~915 MB/s    |
+| `zip`  | 5.4 %  | ~920 MB/s    |
+| `zst`  | 4.7 %  | ~250 MB/s    |
+| `br`   | 4.7 %  | ~248 MB/s    |
+| `xz`   | 4.8 %  | ~20 MB/s     |
+| `bz2`  | 4.8 %  | ~6 MB/s      |
+
+Read it plainly: **`lz4`** when speed is everything, **`zst`** for balance (and far better ratio at higher levels), **`xz`** when you have time and want the bytes gone.
+
+---
+
+## 🕯️ Legacy
+
+The first incantations still answer, hidden but intact:
+
+```sh
+abyssc zip   -s file.txt -d archive.zip
+abyssc unzip -s archive.zip -o ./out
+```
+
+They are thin shells over `compress`/`extract`. Prefer the new forms.
+
+---
+
+## 🌑 Closing
+
+> *"It is only natural that those without power have no voice."*
+
+AbyssC has no interest in the politics of file formats. It compresses, it extracts, it does so quickly. The rest is surface noise.

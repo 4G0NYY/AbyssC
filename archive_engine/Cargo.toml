@@ -1,8 +1,24 @@
 [package]
 name = "archive_engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-# Standard zip format implementation
+# Multi-file archive container with classic DEFLATE
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+# Streaming tar container for bundling files/directories ahead of a codec
+tar = "0.4"
+
+# --- Compression codecs ---
+# gzip / DEFLATE (pure Rust)
+flate2 = "1"
+# Zstandard: the speed/ratio sweet spot, with multithreaded encoding
+zstd = { version = "0.13", features = ["zstdmt"] }
+# LZ4: fastest throughput. Drop the "safe" features for the faster unsafe code path.
+lz4_flex = { version = "0.11", default-features = false, features = ["frame", "std"] }
+# xz / LZMA: high ratio
+xz2 = "0.1"
+# bzip2: common legacy format
+bzip2 = "0.4"
+# brotli: web-standard codec (pure Rust)
+brotli = "7"

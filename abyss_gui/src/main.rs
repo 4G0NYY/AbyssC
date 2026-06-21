@@ -9,11 +9,13 @@
 
 mod archive_kind;
 mod browser;
+mod single_instance;
 mod theme;
 mod update;
 
 use archive_kind::ArchiveKind;
 use browser::{Activated, BrowseRow, Location, RowKind};
+use single_instance::{Inbox, Instance};
 use update::UpdateInfo;
 
 use archive_engine::{CodecOptions, Format, Listing, Progress};
@@ -22,6 +24,7 @@ use iced::widget::{
     Space,
 };
 use iced::{Alignment, Element, Length, Size, Subscription, Task};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,16 +32,32 @@ use std::time::{Duration, Instant};
 
 pub fn main() -> iced::Result {
     let launch = parse_launch();
+
+    // A multi-select "Compress with AbyssC" fires this exe once per file. Make
+    // the first one the window and forward the rest into it (one archive).
+    let inbox: Inbox = Arc::new(Mutex::new(VecDeque::new()));
+    let ipc_enabled = match single_instance::acquire(&launch.forward_paths()) {
+        Instance::Forwarded => return Ok(()), // handed our path to the primary; done.
+        Instance::Primary(listener) => {
+            single_instance::serve(listener, inbox.clone());
+            true
+        }
+        Instance::Standalone => false,
+    };
+
+    let boot_inbox = inbox.clone();
     iced::application("AbyssC — compression from the depths", Abyss::update, Abyss::view)
         .theme(|_| theme::abyss())
         .subscription(Abyss::subscription)
+        .font(include_bytes!("../assets/DejaVuSans.ttf").as_slice())
+        .default_font(iced::Font::with_name("DejaVu Sans"))
         .window(iced::window::Settings {
             size: Size::new(1000.0, 700.0),
             min_size: Some(Size::new(840.0, 620.0)),
             icon: window_icon(),
             ..Default::default()
         })
-        .run_with(move || (Abyss::with_launch(launch), startup_task()))
+        .run_with(move || (Abyss::boot(launch, boot_inbox.clone(), ipc_enabled), startup_task()))
 }
 
 /// The window/taskbar icon, decoded from the embedded `.ico`.
@@ -62,6 +81,17 @@ enum Launch {
     Compress(PathBuf),
     Extract(PathBuf),
     Browse(PathBuf),
+}
+
+impl Launch {
+    /// Paths to forward to an already-running instance. Only *compress* launches
+    /// accumulate (multi-select → one archive); other intents open their own window.
+    fn forward_paths(&self) -> Vec<PathBuf> {
+        match self {
+            Launch::Compress(p) => vec![p.clone()],
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// Parse `--compress|--extract|--browse <path>`, or infer from a bare path.
@@ -142,6 +172,10 @@ struct Abyss {
     status: Status,
     fraction: f32,
     update: Option<UpdateInfo>,
+
+    // Inter-instance: paths forwarded by other launches (multi-select compress).
+    incoming: Inbox,
+    ipc_enabled: bool,
 }
 
 impl Abyss {
@@ -168,12 +202,16 @@ impl Abyss {
             status: Status::Idle,
             fraction: 0.0,
             update: None,
+            incoming: Arc::new(Mutex::new(VecDeque::new())),
+            ipc_enabled: false,
         }
     }
 
-    /// Build the app and apply a launch intent (from the command line).
-    fn with_launch(launch: Launch) -> Self {
+    /// Build the app, wire the cross-instance inbox, and apply the launch intent.
+    fn boot(launch: Launch, incoming: Inbox, ipc_enabled: bool) -> Self {
         let mut app = Self::new();
+        app.incoming = incoming;
+        app.ipc_enabled = ipc_enabled;
         match launch {
             Launch::Normal => {}
             Launch::Compress(path) => {
@@ -235,6 +273,9 @@ enum Message {
     UpdateChecked(Option<UpdateInfo>),
     OpenRelease,
     DismissUpdate,
+
+    // Paths forwarded from another launched instance (multi-select compress).
+    PollExternal,
 }
 
 // --- Update ----------------------------------------------------------------
@@ -354,6 +395,18 @@ impl Abyss {
                 Mode::Browse => self.navigate_to_dropped(path),
             },
 
+            Message::PollExternal => {
+                let drained: Vec<PathBuf> = match self.incoming.lock() {
+                    Ok(mut q) => q.drain(..).collect(),
+                    Err(_) => Vec::new(),
+                };
+                if !drained.is_empty() && !self.busy() {
+                    self.mode = Mode::Compress;
+                    self.add_inputs(drained);
+                    self.status = Status::Idle;
+                }
+            }
+
             Message::UpdateChecked(info) => self.update = info,
             Message::OpenRelease => {
                 if let Some(u) = &self.update {
@@ -374,13 +427,17 @@ impl Abyss {
             _ => None,
         });
 
+        let mut subs = vec![drops];
         if self.busy() {
-            let ticks =
-                iced::time::every(Duration::from_millis(60)).map(|_| Message::Tick);
-            Subscription::batch([drops, ticks])
-        } else {
-            drops
+            subs.push(iced::time::every(Duration::from_millis(60)).map(|_| Message::Tick));
         }
+        if self.ipc_enabled {
+            // Pick up files forwarded by sibling instances. Idle when none arrive.
+            subs.push(
+                iced::time::every(Duration::from_millis(250)).map(|_| Message::PollExternal),
+            );
+        }
+        Subscription::batch(subs)
     }
 }
 
@@ -593,7 +650,7 @@ impl Abyss {
         container(
             row![
                 text(format!(
-                    "✦  A new depth has surfaced — v{} awaits.",
+                    "★  A new depth has surfaced — v{} awaits.",
                     update.version
                 ))
                 .size(13)
@@ -621,11 +678,17 @@ impl Abyss {
             row![
                 text("◆").size(26).color(theme::VIOLET),
                 text("ABYSSC").size(26).color(theme::CYAN),
+                container(
+                    text(concat!("v", env!("CARGO_PKG_VERSION"))).size(11).color(theme::CYAN)
+                )
+                .style(theme::chip)
+                .padding([2, 9]),
             ]
-            .spacing(8),
+            .spacing(10)
+            .align_y(Alignment::Center),
             text("compression from the depths").size(12).color(theme::MUTED),
         ]
-        .spacing(2);
+        .spacing(3);
 
         let tabs = container(
             row![
@@ -713,7 +776,7 @@ impl Abyss {
                         row![
                             text(kind).size(11).color(theme::MUTED).width(Length::Fixed(34.0)),
                             text(name).size(13).color(theme::TEXT).width(Length::Fill),
-                            button(text("✕").size(13)).style(theme::danger_ghost).padding([2, 8])
+                            button(text("×").size(15)).style(theme::danger_ghost).padding([2, 9])
                                 .on_press_maybe((!self.busy()).then_some(Message::RemoveInput(i))),
                         ]
                         .align_y(Alignment::Center)
@@ -949,13 +1012,13 @@ impl Abyss {
     // --- Browse / Commander ------------------------------------------------
 
     fn browse_view(&self) -> Element<'_, Message> {
-        let up = button(text("⬆ Up").size(13))
+        let up = button(text("↑ Up").size(13))
             .style(theme::ghost)
             .padding([7, 14])
             .on_press_maybe(self.location.can_up().then_some(Message::BrowseUp));
         let home = button(text("⌂").size(15)).style(theme::ghost).padding([7, 12])
             .on_press(Message::BrowseHome);
-        let refresh = button(text("⟳").size(15)).style(theme::ghost).padding([7, 12])
+        let refresh = button(text("↻").size(15)).style(theme::ghost).padding([7, 12])
             .on_press(Message::BrowseRefresh);
 
         let loc_bar = container(text(self.location.label()).size(13).color(theme::TEXT))
@@ -965,7 +1028,7 @@ impl Abyss {
 
         // Context action depends on where we stand.
         let action: Element<_> = if self.location.in_archive() {
-            button(text("Extract archive ⤓").size(13))
+            button(text("Extract archive ↓").size(13))
                 .style(theme::primary)
                 .padding([8, 16])
                 .on_press(Message::BrowseExtractHere)
@@ -995,7 +1058,7 @@ impl Abyss {
                     .style(theme::card)
                     .padding(10)
                     .height(Length::Fill),
-                text(format!("✖ {err}")).size(12).color(theme::RED),
+                text(format!("× {err}")).size(12).color(theme::RED),
             ]
             .spacing(8)
             .into()
@@ -1013,11 +1076,11 @@ impl Abyss {
 
     fn browse_line(&self, i: usize, row: &BrowseRow) -> Element<'_, Message> {
         let (glyph, glyph_color) = match row.kind {
-            RowKind::Parent => ("⤴", theme::MUTED),
+            RowKind::Parent => ("↑", theme::MUTED),
             RowKind::Drive => ("▣", theme::CYAN),
-            RowKind::Dir => ("▸", theme::CYAN),
-            RowKind::Archive => ("◈", theme::VIOLET),
-            RowKind::File => ("·", theme::MUTED),
+            RowKind::Dir => ("▶", theme::CYAN),
+            RowKind::Archive => ("◆", theme::VIOLET),
+            RowKind::File => ("•", theme::MUTED),
         };
         let name_color = match row.kind {
             RowKind::Archive => theme::VIOLET,
@@ -1090,7 +1153,7 @@ impl Abyss {
                 theme::CYAN,
             ),
             Status::Done(m) => (m.clone(), theme::GREEN),
-            Status::Failed(m) => (format!("✖ {m}"), theme::RED),
+            Status::Failed(m) => (format!("× {m}"), theme::RED),
         };
 
         let action_label = match self.mode {

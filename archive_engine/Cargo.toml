@@ -1,0 +1,8 @@
+[package]
+name = "archive_engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Standard zip format implementation
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }

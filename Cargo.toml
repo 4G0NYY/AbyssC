@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "orchestrator",
+    "archive_engine"
+]
+resolver = "2"
+

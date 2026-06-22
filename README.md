@@ -300,17 +300,21 @@ Only `.abyss` can be sealed: pass `-p, --password` to encrypt it. `.ans` and
 
 50 MB of mixed compressible/incompressible data, default levels, one machine. *Your depths will differ.*
 
-| Format | Ratio  | Throughput   |
-| ------ | ------ | ------------ |
-| `lz4`  | 5.1 %  | ~1600 MB/s   |
-| `gz`   | 5.4 %  | ~915 MB/s    |
-| `zip`  | 5.4 %  | ~920 MB/s    |
-| `zst`  | 4.7 %  | ~250 MB/s    |
-| `br`   | 4.7 %  | ~248 MB/s    |
-| `xz`   | 4.8 %  | ~20 MB/s     |
-| `bz2`  | 4.8 %  | ~6 MB/s      |
+| Format   | Ratio   | Throughput   |
+| -------- | ------- | ------------ |
+| `lz4`    | 7.9 %   | ~1170 MB/s   |
+| `zst`    | 4.2 %   | ~1160 MB/s   |
+| `gz`     | 6.0 %   | ~475 MB/s    |
+| `zip`    | 6.0 %   | ~470 MB/s    |
+| `ans`    | 62.8 %  | ~157 MB/s    |
+| `.abyss` | 62.8 %  | ~157 MB/s    |
+| `br`     | 4.0 %   | ~110 MB/s    |
+| `bz2`    | 4.3 %   | ~15 MB/s     |
+| `xz`     | 2.7 %   | ~9 MB/s      |
 
 Read it plainly: **`lz4`** when speed is everything, **`zst`** for balance (and far better ratio at higher levels), **`xz`** when you have time and want the bytes gone.
+
+**On our own sigil.** `ans` — and the `.abyss` form it folds — is an **order-0 entropy coder**, from scratch and beholden to no crate. It does not hunt for repetition the way the LZ-bound codecs do; it weighs only how often each byte appears and spends bits accordingly. So where the surface's codecs feast on this redundant set and crush it to a sliver, the Abyss reports the data's *true* entropy — an honest, unflattering 62.8 % — at a steady ~157 MB/s, the container costing all but nothing over the raw coder. Hand it data with skewed symbols but little repetition (or a payload to **seal**), and it folds at one calm, predictable speed. It claims no crown for ratio; it answers only to its own arithmetic.
 
 ---
 

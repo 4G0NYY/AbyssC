@@ -20,7 +20,7 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "abyss_gui"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "archive_engine",
  "iced",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "archive_engine"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "argon2",
  "brotli",
@@ -3017,7 +3017,7 @@ dependencies = [
 
 [[package]]
 name = "orchestrator"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "archive_engine",
  "clap",

@@ -332,6 +332,15 @@ fn print_guide() {
    single-stream (.zst, .gz, .ans, ...) take ONE file.
    tar.*, .zip, and .abyss swallow whole directories.
 
+ READ-ONLY  (the surface's forms — list & extract, never create)
+   .jar .war .ear .apk   ZIP under the skin.
+   .7z                   7-Zip. lzma/lzma2/bzip2/ppmd, AES-256.
+   .rar                  RAR. creation is proprietary.
+   .iso                  ISO-9660 disc images.
+
+   abyssc l -i game.iso              walk a disc image's contents
+   abyssc x -i bundle.7z -o ./out    unfold a .7z (compress refuses it)
+
  EFFICIENT PATHS
    abyssc c -o backup.tar.zst project/        bundle a tree, fast
    abyssc c -o data.lz4 data.bin              maximum throughput

@@ -1,8 +1,8 @@
 //! Inspect an archive's contents without extracting it.
 
-use crate::abyss;
 use crate::decompress::raw_output_name;
 use crate::format::{Container, Format};
+use crate::{abyss, iso_archive, rar_archive, sevenz_archive};
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -39,6 +39,9 @@ pub fn list(src: &Path, format: Format, password: Option<&str>) -> io::Result<Li
     let entries = match format.container {
         Container::Zip => list_zip(src)?,
         Container::Abyss => abyss::list(src, password)?,
+        Container::SevenZip => sevenz_archive::list(src)?,
+        Container::Rar => rar_archive::list(src)?,
+        Container::Iso => iso_archive::list(src)?,
         Container::Tar => list_tar(src, format)?,
         Container::Raw => {
             return Ok(Listing {

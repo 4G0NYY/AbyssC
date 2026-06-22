@@ -24,7 +24,7 @@ use iced::widget::{
     Space,
 };
 use iced::{Alignment, Element, Length, Size, Subscription, Task};
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -170,7 +170,12 @@ struct Abyss {
     location: Location,
     rows: Vec<BrowseRow>,
     selected: Option<usize>,
+    /// Members (by full archive-internal path) ticked for "extract selected".
+    /// Only meaningful while standing inside an archive; cleared on every move.
+    marked: BTreeSet<String>,
     browse_error: Option<String>,
+    /// A transient success line after drawing marked files out (green).
+    browse_note: Option<String>,
     /// Name of a member currently being drawn out of an archive to open.
     opening: Option<String>,
     /// Last activated row + when, for detecting a double-click to open.
@@ -207,7 +212,9 @@ impl Abyss {
             location,
             rows,
             selected: None,
+            marked: BTreeSet::new(),
             browse_error: None,
+            browse_note: None,
             opening: None,
             last_click: None,
             job: None,
@@ -281,6 +288,15 @@ enum Message {
     BrowseRefresh,
     BrowseToCompress,
     BrowseExtractHere,
+    /// Tick/untick a file (by its archive-internal path) for "extract selected".
+    BrowseToggleMark(String),
+    /// Pull the ticked members out — open a folder picker first.
+    BrowseExtractMarked,
+    BrowseExtractMarkedTo(Option<PathBuf>),
+    /// Pull the ticked members straight onto the Desktop.
+    BrowseExtractToDesktop,
+    /// The ticked members finished being drawn out (or failed).
+    MarkedExtracted(Result<String, String>),
 
     // Shared.
     Start,
@@ -485,6 +501,56 @@ impl Abyss {
                     self.mode = Mode::Extract;
                 }
             }
+            Message::BrowseToggleMark(member) => {
+                if !self.marked.remove(&member) {
+                    self.marked.insert(member);
+                }
+                self.browse_note = None;
+            }
+            Message::BrowseExtractMarked => {
+                if self.marked.is_empty() || self.opening.is_some() {
+                    return Task::none();
+                }
+                // Default the picker to the archive's own folder.
+                let dir = match &self.location {
+                    Location::Archive { path, .. } => path.parent().map(PathBuf::from),
+                    _ => None,
+                };
+                return Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new();
+                        if let Some(dir) = dir {
+                            dialog = dialog.set_directory(dir);
+                        }
+                        dialog.pick_folder().await.map(|h| h.path().to_path_buf())
+                    },
+                    Message::BrowseExtractMarkedTo,
+                );
+            }
+            Message::BrowseExtractMarkedTo(path) => {
+                if let Some(path) = path {
+                    return self.extract_marked_to(path);
+                }
+            }
+            Message::BrowseExtractToDesktop => {
+                if self.marked.is_empty() || self.opening.is_some() {
+                    return Task::none();
+                }
+                match desktop_dir() {
+                    Some(desk) => return self.extract_marked_to(desk),
+                    None => self.browse_error = Some("Could not find your Desktop.".to_string()),
+                }
+            }
+            Message::MarkedExtracted(result) => {
+                self.opening = None;
+                match result {
+                    Ok(msg) => {
+                        self.browse_note = Some(msg);
+                        self.marked.clear();
+                    }
+                    Err(e) => self.browse_error = Some(e),
+                }
+            }
 
             Message::Start => self.start_job(),
             Message::Tick => self.poll_job(),
@@ -627,7 +693,36 @@ impl Abyss {
         self.location = loc;
         self.rows = browser::rows_for(&self.location);
         self.selected = None;
+        // Marks belong to one archive position; a move discards them.
+        self.marked.clear();
         self.browse_error = None;
+        self.browse_note = None;
+    }
+
+    /// Draw the ticked members out of the current archive into `dest_dir`,
+    /// decompressing only those members — the whole point of the feature. Runs on
+    /// a blocking worker thread so the window stays fluid.
+    fn extract_marked_to(&mut self, dest_dir: PathBuf) -> Task<Message> {
+        let Location::Archive { path, format, .. } = &self.location else {
+            return Task::none();
+        };
+        if self.marked.is_empty() {
+            return Task::none();
+        }
+        let src = path.clone();
+        let format = *format;
+        let members: Vec<String> = self.marked.iter().cloned().collect();
+        self.opening = Some(format!("{} file(s)", members.len()));
+        self.browse_error = None;
+        self.browse_note = None;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || extract_members(&src, format, &members, &dest_dir))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::MarkedExtracted,
+        )
     }
 
     /// The full on-disk path of the selected filesystem row, if it is one.
@@ -1244,11 +1339,30 @@ impl Abyss {
 
         // Context action depends on where we stand.
         let action: Element<_> = if self.location.in_archive() {
-            button(text("Extract archive ↓").size(13))
-                .style(theme::primary)
-                .padding([8, 16])
-                .on_press(Message::BrowseExtractHere)
+            // Inside an archive: tick files to pull just those out, else extract whole.
+            if self.marked.is_empty() {
+                button(text("Extract archive ↓").size(13))
+                    .style(theme::primary)
+                    .padding([8, 16])
+                    .on_press(Message::BrowseExtractHere)
+                    .into()
+            } else {
+                let n = self.marked.len();
+                let idle = self.opening.is_none();
+                row![
+                    button(text(format!("Extract selected ({n}) →")).size(13))
+                        .style(theme::primary)
+                        .padding([8, 16])
+                        .on_press_maybe(idle.then_some(Message::BrowseExtractMarked)),
+                    button(text("⤓ To Desktop").size(13))
+                        .style(theme::ghost)
+                        .padding([8, 14])
+                        .on_press_maybe(idle.then_some(Message::BrowseExtractToDesktop)),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center)
                 .into()
+            }
         } else if self.selected_fs_path().is_some() {
             button(text("→ Add to Compress").size(13))
                 .style(theme::ghost)
@@ -1311,7 +1425,7 @@ impl Abyss {
         let style =
             if self.selected == Some(i) { theme::browse_row_selected } else { theme::browse_row };
 
-        button(
+        let main = button(
             row![
                 text(glyph).size(14).color(glyph_color).width(Length::Fixed(26.0)),
                 text(row.name.clone()).size(13).color(name_color).width(Length::Fill),
@@ -1323,21 +1437,45 @@ impl Abyss {
         .style(style)
         .padding([6, 10])
         .width(Length::Fill)
-        .on_press(Message::BrowseActivate(i))
-        .into()
+        .on_press(Message::BrowseActivate(i));
+
+        // Inside an archive, file rows gain a tick box for "extract selected".
+        // A fixed-width lead keeps folder/parent rows aligned with the boxes.
+        if let Location::Archive { inner, .. } = &self.location {
+            let lead: Element<_> = if row.kind == RowKind::File {
+                let member = format!("{inner}{}", row.name);
+                let (mark, mark_color) = if self.marked.contains(&member) {
+                    ("☑", theme::CYAN)
+                } else {
+                    ("☐", theme::MUTED)
+                };
+                button(text(mark).size(15).color(mark_color))
+                    .style(theme::browse_row)
+                    .padding([4, 8])
+                    .on_press(Message::BrowseToggleMark(member))
+                    .into()
+            } else {
+                Space::with_width(Length::Fixed(33.0)).into()
+            };
+            row![lead, main].spacing(2).align_y(Alignment::Center).into()
+        } else {
+            main.into()
+        }
     }
 
     fn browse_status(&self) -> Element<'_, Message> {
         let (msg, color) = if let Some(name) = &self.opening {
-            (format!("◓  Drawing “{name}” from the depths — it will open shortly…"), theme::CYAN)
+            (format!("◓  Drawing {name} from the depths…"), theme::CYAN)
         } else if let Some(err) = &self.browse_error {
             (err.clone(), theme::RED)
+        } else if let Some(note) = &self.browse_note {
+            (note.clone(), theme::GREEN)
         } else if let Some(path) = self.selected_fs_path() {
             (path.display().to_string(), theme::TEXT)
         } else {
             let count = self.rows.iter().filter(|r| r.kind != RowKind::Parent).count();
             let hint = if self.location.in_archive() {
-                "peering inside — nothing is unpacked to disk"
+                "peering inside — double-click to open, or tick files and Extract selected"
             } else {
                 "double-step a folder or archive to enter"
             };
@@ -1502,6 +1640,36 @@ fn open_archive_member(src: &Path, format: Format, member: &str, name: &str) -> 
     archive_engine::extract_member(src, format, member, &dest, None).map_err(|e| e.to_string())?;
     open_path(&dest);
     Ok(())
+}
+
+/// Draw a set of members out of an archive into `dest_dir`, each decompressed on
+/// its own (never the whole archive). Each lands under its base name, so files
+/// arrive directly in the chosen folder rather than nested in their archive tree.
+fn extract_members(
+    src: &Path,
+    format: Format,
+    members: &[String],
+    dest_dir: &Path,
+) -> Result<String, String> {
+    std::fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    for member in members {
+        let name = member.rsplit('/').next().unwrap_or(member);
+        let dest = dest_dir.join(name);
+        // The Commander only browses unsealed archives, so no password is needed.
+        archive_engine::extract_member(src, format, member, &dest, None)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(format!("Drew {} file(s) to {}", members.len(), dest_dir.display()))
+}
+
+/// The user's Desktop folder, for the one-click "To Desktop" extraction.
+fn desktop_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    let desktop = PathBuf::from(home?).join("Desktop");
+    desktop.is_dir().then_some(desktop)
 }
 
 /// Open a filesystem path with the OS default handler.

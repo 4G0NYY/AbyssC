@@ -12,8 +12,11 @@ pub mod compress;
 mod crypto;
 pub mod decompress;
 pub mod format;
+mod iso_archive;
 pub mod listing;
 pub mod progress;
+mod rar_archive;
+mod sevenz_archive;
 mod util;
 mod zip_archive;
 

@@ -68,9 +68,22 @@ pub fn compress_with_progress(
     let uncompressed = util::total_size(inputs);
     progress.set_total(uncompressed);
 
+    // Foreign formats are read-only: the engine opens them, but the surface keeps
+    // the right to forge them. Refuse rather than produce a broken file.
+    if !format.container.writable() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "{} archives can be read, browsed, and extracted, but not created by AbyssC",
+                format.label()
+            ),
+        ));
+    }
+
     match format.container {
         Container::Zip => zip_archive::compress(inputs, dest, opts, progress)?,
         Container::Abyss => abyss::compress(inputs, dest, progress, opts.password.as_deref())?,
+        Container::SevenZip | Container::Rar | Container::Iso => unreachable!("rejected above"),
         Container::Raw => {
             if inputs.len() != 1 || inputs[0].is_dir() {
                 return Err(io::Error::new(

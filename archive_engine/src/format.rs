@@ -17,6 +17,21 @@ pub enum Container {
     /// The sealed `.abyss` form: a tar bundle, ANS-coded, optionally encrypted.
     /// Like `Zip`, it bundles, compresses, and seals in one pass.
     Abyss,
+    /// A 7-Zip (`.7z`) archive. **Read-only** — we list/browse/extract, never create.
+    SevenZip,
+    /// A RAR (`.rar`) archive. **Read-only** — RAR creation is proprietary.
+    Rar,
+    /// An ISO-9660 (`.iso`) disc image. **Read-only**.
+    Iso,
+}
+
+impl Container {
+    /// Whether this container can be *created* by the engine. Foreign formats
+    /// (`.7z`, `.rar`, `.iso`) are read-only: we open them, but the surface keeps
+    /// the right to forge them.
+    pub fn writable(self) -> bool {
+        !matches!(self, Container::SevenZip | Container::Rar | Container::Iso)
+    }
 }
 
 /// A fully-resolved archive format.
@@ -58,6 +73,16 @@ impl Format {
             (".tar", Tar, Store),
             (".abyss", Abyss, Ans),
             (".zip", Zip, Store),
+            // The ZIP family: all ZIP under the skin, so they ride the same path.
+            (".jar", Zip, Store),
+            (".war", Zip, Store),
+            (".ear", Zip, Store),
+            (".apk", Zip, Store),
+            (".zipx", Zip, Store),
+            // Foreign, read-only containers. Codec is irrelevant (handled within).
+            (".7z", SevenZip, Store),
+            (".rar", Rar, Store),
+            (".iso", Iso, Store),
             (".gz", Raw, Gzip),
             (".zst", Raw, Zstd),
             (".lz4", Raw, Lz4),
@@ -81,7 +106,10 @@ impl Format {
             "abyss" => Format::new(Abyss, Ans),
             "ans" => Format::new(Raw, Ans),
             "tar.ans" => Format::new(Tar, Ans),
-            "zip" => Format::new(Zip, Store),
+            "zip" | "jar" | "war" | "ear" | "apk" | "zipx" => Format::new(Zip, Store),
+            "7z" | "7zip" | "sevenzip" => Format::new(SevenZip, Store),
+            "rar" => Format::new(Rar, Store),
+            "iso" => Format::new(Iso, Store),
             "tar" => Format::new(Tar, Store),
             "gz" | "gzip" => Format::new(Raw, Gzip),
             "zst" | "zstd" => Format::new(Raw, Zstd),
@@ -104,6 +132,9 @@ impl Format {
         match self.container {
             Container::Zip => "zip".to_string(),
             Container::Abyss => "abyss".to_string(),
+            Container::SevenZip => "7z".to_string(),
+            Container::Rar => "rar".to_string(),
+            Container::Iso => "iso".to_string(),
             Container::Raw => self.codec.name().to_string(),
             Container::Tar => match self.codec {
                 Codec::Store => "tar".to_string(),

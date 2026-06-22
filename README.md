@@ -18,7 +18,13 @@ One command, many codecs. The format is chosen by the extension you name — not
 - **Streaming by nature.** Bytes flow through 1 MiB buffers. Nothing is held whole in memory — a 100 GB file costs the same RAM as a 100 KB one.
 - **Multithreaded `zstd`.** It claims every core you give it, or as many as you permit.
 - **Whole directories.** `tar.*`, `.zip`, and `.abyss` swallow entire trees. The single streams take one file, as is their nature.
+- **Reads the surface's forms too.** Beyond what it forges, the Abyss opens the
+  surface's own containers — **`.7z`**, **`.rar`**, **`.iso`**, and the ZIP family
+  (**`.jar` `.war` `.ear` `.apk`**) — to list, browse, and extract. These it reads;
+  it does not deign to create them.
 - **Inspect without touching.** List an archive's contents without unfolding it.
+- **Pull one thing out.** Draw a single file straight out of an archive without
+  unfolding the whole — the cost is the member, not the orb.
 
 ---
 
@@ -37,6 +43,10 @@ The engine does not tangle its concerns. An **archive format** is the union of t
    │  Zip    │      └──────────────────────────────────┘
    │  Abyss  │
    └─────────┘
+   read-only foreign containers (no codec of ours):
+   ┌──────────────────────────────┐
+   │  SevenZip · Rar · Iso        │   list · browse · extract
+   └──────────────────────────────┘
 ```
 
 - **`archive_engine`** — the disciplined core. A library, no voice of its own.
@@ -45,8 +55,11 @@ The engine does not tangle its concerns. An **archive format** is the union of t
   - `crypto.rs` — password sealing: an Argon2id key driving a ChaCha20-Poly1305 STREAM. Layered as a plain `Write`/`Read`, so it wraps any stream.
   - `abyss.rs` — the `.abyss` container: a tar bundle, ANS-coded, optionally encrypted — finalized in one disciplined pass.
   - `format.rs` — `Format = Container + Codec`, with extension detection.
-  - `compress.rs` / `decompress.rs` — dispatch over `Raw`, `Tar`, `Zip`, `Abyss`.
+  - `compress.rs` / `decompress.rs` — dispatch over every container; foreign forms
+    are read-only, so `compress` refuses them rather than forge a broken file.
   - `zip_archive.rs` — the `zip` path, which bundles and compresses in one pass.
+  - `sevenz_archive.rs` · `rar_archive.rs` · `iso_archive.rs` — the read-only
+    foreign containers: list, browse, and extract (whole or one member).
   - `listing.rs` — reads an archive's table of contents.
 - **`orchestrator`** — the hand that gestures. A thin CLI (`abyssc`) that resolves a format and calls the core.
 - **`abyss_gui`** — the same hand, made visible. A sleek windowed front-end (`abyssc-gui`), peer to the CLI, that calls the very same core.
@@ -203,9 +216,14 @@ cargo run --release -p abyss_gui
 - **Three modes.** *Compress* (gather sources, choose a form, fold them),
   *Extract* (open an archive, peer inside, unfold it), and *Commander*.
 - **The Commander.** A file browser that treats archives as folders. Step into a
-  `.tar.zst` and walk its directories as though they lay open on disk — nothing
-  is ever decompressed to look inside. From within, extract the whole thing in a
-  click; from the filesystem, send any file straight to *Compress*.
+  `.tar.zst` — or a `.7z`, `.rar`, `.iso`, `.jar` — and walk its directories as
+  though they lay open on disk; nothing is ever decompressed to look inside. From
+  within, extract the whole thing in a click; from the filesystem, send any file
+  straight to *Compress*.
+- **Draw out only what you want.** Inside an archive, tick a file (or several)
+  and **Extract selected** them to a folder — or send them straight **⤓ To Desktop**.
+  Only those members are decompressed; the rest of the orb stays sealed. Double-click
+  a single file to open it in its default app the same way.
 - **Seal it.** Choose the **Abyss (sealed)** form and a password field appears;
   type a key to encrypt the archive. The Extract tab asks for the key in turn —
   a sealed archive will not even reveal its contents without it.
@@ -238,6 +256,18 @@ The GUI shares the engine with the CLI exactly; neither knows the other exists.
 | `.br`, `.tar.br`       | brotli   | raw / tar | The web's chosen ratio.                       |
 | `.zip`                 | deflate  | zip       | Portable. Compresses per entry.               |
 | `.tar`                 | store    | tar       | Bundle only. No compression.                  |
+
+### Read-only — the surface's forms
+
+These the Abyss opens but will not forge. List them, browse them as folders, and
+extract them — in whole or one member at a time.
+
+| Extension                       | Container | Disposition                                  |
+| ------------------------------- | --------- | -------------------------------------------- |
+| `.jar` `.war` `.ear` `.apk`     | zip       | ZIP under the skin. Read with the `.zip` path. |
+| `.7z`                           | 7-Zip     | Read-only. lzma/lzma2/bzip2/ppmd, AES-256.   |
+| `.rar`                          | RAR       | Read-only. RAR creation is proprietary.      |
+| `.iso`                          | ISO-9660  | Read-only. Disc images, walked as folders.   |
 
 Short aliases (`.tgz`, `.tzst`, `.txz`, `.tbz2`) are recognized. Use `--format <name>` to override detection.
 

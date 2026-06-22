@@ -33,3 +33,14 @@ argon2 = "0.5"
 rand = "0.8"
 # Wipe derived keys from memory on drop.
 zeroize = "1"
+# --- Foreign formats: read-only. We list/browse/extract these, but the surface
+#     keeps the right to forge them, so none can be created. ---
+# 7-Zip (.7z): pure Rust, with the common 7z codecs (lzma/lzma2/bzip2/ppmd) and
+# AES-256 for reading encrypted archives.
+sevenz-rust2 = "0.21"
+# RAR (.rar): bindings over the official unrar C source. Read-only by nature —
+# RAR creation is proprietary. Compiles the bundled C through the system toolchain.
+unrar = "0.5"
+# ISO-9660 (.iso) disc images. Pure Rust (its FUSE binding is a dev-dependency
+# only, so nothing platform-specific reaches our build) — we only ever read.
+iso9660 = "0.1"

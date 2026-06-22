@@ -3,7 +3,7 @@
 use crate::codec::Codec;
 use crate::format::{Container, Format};
 use crate::progress::{CountReader, Progress};
-use crate::{abyss, zip_archive};
+use crate::{abyss, iso_archive, rar_archive, sevenz_archive, zip_archive};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +42,9 @@ pub fn decompress_with_progress(
     match format.container {
         Container::Zip => zip_archive::decompress(src, out_dir, progress),
         Container::Abyss => abyss::decompress(src, out_dir, progress, password),
+        Container::SevenZip => sevenz_archive::decompress(src, out_dir, progress),
+        Container::Rar => rar_archive::decompress(src, out_dir, progress),
+        Container::Iso => iso_archive::decompress(src, out_dir, progress),
         Container::Tar => {
             fs::create_dir_all(out_dir)?;
             progress.set_total(fs::metadata(src).map(|m| m.len()).unwrap_or(0));
@@ -92,6 +95,9 @@ pub fn extract_member(
     }
     match format.container {
         Container::Abyss => abyss::extract_member(src, inner, dest, password),
+        Container::SevenZip => sevenz_archive::extract_member(src, inner, dest),
+        Container::Rar => rar_archive::extract_member(src, inner, dest),
+        Container::Iso => iso_archive::extract_member(src, inner, dest),
         Container::Raw => {
             let file = File::open(src)?;
             format.codec.decompress(file, |reader| {

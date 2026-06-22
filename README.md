@@ -16,7 +16,7 @@ One command, many codecs. The format is chosen by the extension you name — not
 - **Four containers.** A single compressed stream, a `tar` bundle, a portable `zip`, or the sealed **`.abyss`** form.
 - **Sealed archives.** The `.abyss` form can be **encrypted with a password** — ChaCha20-Poly1305 over an Argon2id key, authenticated end to end. The surface cannot read what it cannot open.
 - **Streaming by nature.** Bytes flow through 1 MiB buffers. Nothing is held whole in memory — a 100 GB file costs the same RAM as a 100 KB one.
-- **Multithreaded `zstd`.** It claims every core you give it, or as many as you permit.
+- **Multicore by nature.** `zstd` claims every core you give it; our own **`ans`** coder folds its independent blocks across every core too — order-0 entropy at LZ-class throughput.
 - **Whole directories.** `tar.*`, `.zip`, and `.abyss` swallow entire trees. The single streams take one file, as is their nature.
 - **Reads the surface's forms too.** Beyond what it forges, the Abyss opens the
   surface's own containers — **`.7z`**, **`.rar`**, **`.iso`**, and the ZIP family
@@ -51,7 +51,7 @@ The engine does not tangle its concerns. An **archive format** is the union of t
 
 - **`archive_engine`** — the disciplined core. A library, no voice of its own.
   - `codec.rs` — every algorithm behind one inversion-of-control API. Each codec wraps a stream and handles its own finalization. The container layer never learns their secrets.
-  - `ans.rs` — the engine's **own** entropy coder: a from-scratch, block-based rANS (asymmetric numeral system). Owes nothing to an external crate.
+  - `ans.rs` — the engine's **own** entropy coder: a from-scratch, block-based rANS (asymmetric numeral system). Owes nothing to an external crate. Four interleaved states per block, reciprocal-multiply encoding, a single-lookup decode table, and independent blocks folded across every core.
   - `crypto.rs` — password sealing: an Argon2id key driving a ChaCha20-Poly1305 STREAM. Layered as a plain `Write`/`Read`, so it wraps any stream.
   - `abyss.rs` — the `.abyss` container: a tar bundle, ANS-coded, optionally encrypted — finalized in one disciplined pass.
   - `format.rs` — `Format = Container + Codec`, with extension detection.
@@ -302,19 +302,19 @@ Only `.abyss` can be sealed: pass `-p, --password` to encrypt it. `.ans` and
 
 | Format   | Ratio   | Throughput   |
 | -------- | ------- | ------------ |
-| `lz4`    | 7.9 %   | ~1170 MB/s   |
-| `zst`    | 4.2 %   | ~1160 MB/s   |
-| `gz`     | 6.0 %   | ~475 MB/s    |
+| `lz4`    | 7.9 %   | ~1200 MB/s   |
+| `zst`    | 4.2 %   | ~1185 MB/s   |
+| `ans`    | 62.8 %  | ~630 MB/s    |
+| `.abyss` | 62.8 %  | ~565 MB/s    |
+| `gz`     | 6.0 %   | ~490 MB/s    |
 | `zip`    | 6.0 %   | ~470 MB/s    |
-| `ans`    | 62.8 %  | ~157 MB/s    |
-| `.abyss` | 62.8 %  | ~157 MB/s    |
-| `br`     | 4.0 %   | ~110 MB/s    |
+| `br`     | 4.0 %   | ~118 MB/s    |
 | `bz2`    | 4.3 %   | ~15 MB/s     |
-| `xz`     | 2.7 %   | ~9 MB/s      |
+| `xz`     | 2.4 %   | ~10 MB/s     |
 
 Read it plainly: **`lz4`** when speed is everything, **`zst`** for balance (and far better ratio at higher levels), **`xz`** when you have time and want the bytes gone.
 
-**On our own sigil.** `ans` — and the `.abyss` form it folds — is an **order-0 entropy coder**, from scratch and beholden to no crate. It does not hunt for repetition the way the LZ-bound codecs do; it weighs only how often each byte appears and spends bits accordingly. So where the surface's codecs feast on this redundant set and crush it to a sliver, the Abyss reports the data's *true* entropy — an honest, unflattering 62.8 % — at a steady ~157 MB/s, the container costing all but nothing over the raw coder. Hand it data with skewed symbols but little repetition (or a payload to **seal**), and it folds at one calm, predictable speed. It claims no crown for ratio; it answers only to its own arithmetic.
+**On our own sigil.** `ans` — and the `.abyss` form it folds — is an **order-0 entropy coder**, from scratch and beholden to no crate. It does not hunt for repetition the way the LZ-bound codecs do; it weighs only how often each byte appears and spends bits accordingly. So where the surface's codecs feast on this redundant set and crush it to a sliver, the Abyss reports the data's *true* entropy — an honest, unflattering 62.8 %. It claims no crown for ratio; it answers only to its own arithmetic. What it does claim is **speed**: four interleaved rANS states per block, division traded for reciprocal multiplies, a single-lookup decode table, and whole blocks folded across every core at once. That lands it third on this table — outpacing `gzip`, `brotli`, and the rest — and faster still measured in isolation (the raw coder runs past 800 MB/s encode, ~670 MB/s decode, off the disk's leash). Hand it data with skewed symbols but little repetition (or a payload to **seal**), and it folds *fast*.
 
 ---
 

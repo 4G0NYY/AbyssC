@@ -23,6 +23,8 @@ xz2 = "0.1"
 bzip2 = "0.4"
 # brotli: web-standard codec (pure Rust)
 brotli = "7"
+# Data-parallelism: drives the ANS coder's independent blocks across every core.
+rayon = "1"
 
 # --- Encryption for sealed .abyss archives (pure Rust, audited primitives) ---
 # AEAD stream cipher: fast in software, no AES hardware required.

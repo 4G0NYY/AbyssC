@@ -4,9 +4,7 @@
 //! This is a static, order-0, block-based **range ANS** (rANS): a 32-bit state
 //! renormalized one byte at a time, with per-symbol probabilities quantized to a
 //! total of [`TOTAL`]. Each block carries its own frequency table, so the coder
-//! adapts to shifting statistics across a stream while never holding more than one
-//! block in memory — a 100 GB file costs the same RAM as a 100 KB one, exactly as
-//! the rest of the engine demands.
+//! adapts to shifting statistics across a stream.
 //!
 //! It is wrapped as [`AnsWriter`]/[`AnsReader`] — a streaming [`Write`]/[`Read`]
 //! pair — so it slots into the codec layer like any other algorithm, and is reused
@@ -15,7 +13,24 @@
 //! rANS is LIFO: symbols are *encoded* last-to-first and *decoded* first-to-last.
 //! As an order-0 model it captures a source's symbol frequencies, not its
 //! repetitions — it is an entropy stage, not an LZ one.
+//!
+//! # How it earns its speed
+//!
+//! - **Interleaved lanes.** Each block is coded with [`N_LANES`] independent rANS
+//!   states running over a single shared byte stream (symbol `i` rides lane
+//!   `i % N_LANES`). The states have no dependency on one another, so a modern
+//!   out-of-order core keeps several in flight at once instead of stalling on a
+//!   serial chain.
+//! - **Division-free encode.** Each block precomputes a per-symbol reciprocal so
+//!   the encoder's hot loop multiplies and shifts instead of dividing.
+//! - **One-lookup decode.** A packed `slot → (symbol, freq, cum)` table turns the
+//!   decode step into a single table read.
+//! - **Parallel blocks.** Blocks are wholly independent — their own table, their
+//!   own terminal states — so a batch of them is encoded/decoded across every core
+//!   via `rayon`. Only a bounded batch (roughly one block per core) is ever held
+//!   in memory at once, so a 100 GB file costs no more RAM than a 100 MB one.
 
+use rayon::prelude::*;
 use std::io::{self, Read, Write};
 
 /// Probability resolution: every block's frequencies are normalized to sum to
@@ -34,11 +49,43 @@ const RANS_L: u32 = 1 << 23;
 /// streaming buffer size.
 const BLOCK: usize = 1 << 20;
 
-/// Stream magic, so a decoder fails loudly on a non-ANS stream instead of decoding
-/// garbage.
-const MAGIC: &[u8; 4] = b"ANS1";
+/// Independent rANS states coded in parallel within a single block. Four lanes
+/// saturate the execution ports of a typical core without bloating the per-block
+/// terminal-state overhead.
+const N_LANES: usize = 4;
+
+/// Stream magic. Bumped to `ANS2` when the block format gained interleaved lanes —
+/// a decoder fails loudly on an older or non-ANS stream instead of decoding garbage.
+const MAGIC: &[u8; 4] = b"ANS2";
+
+fn invalid(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg)
+}
 
 // --- Frequency model -------------------------------------------------------
+
+/// Tally symbol occurrences. Four interleaved bins break the load-modify-store
+/// dependency chain a single histogram would impose, so the (memory-bound) count
+/// runs closer to the machine's real throughput.
+fn histogram(block: &[u8]) -> [u32; 256] {
+    let mut bins = [[0u32; 256]; 4];
+    let mut chunks = block.chunks_exact(4);
+    for ch in &mut chunks {
+        bins[0][ch[0] as usize] += 1;
+        bins[1][ch[1] as usize] += 1;
+        bins[2][ch[2] as usize] += 1;
+        bins[3][ch[3] as usize] += 1;
+    }
+    for &b in chunks.remainder() {
+        bins[0][b as usize] += 1;
+    }
+
+    let mut counts = [0u32; 256];
+    for i in 0..256 {
+        counts[i] = bins[0][i] + bins[1][i] + bins[2][i] + bins[3][i];
+    }
+    counts
+}
 
 /// Quantize raw symbol counts to frequencies summing to exactly [`TOTAL`], with
 /// every present symbol guaranteed at least 1 (so it stays decodable).
@@ -100,96 +147,182 @@ fn cumulative(freq: &[u16; 256]) -> [u32; 257] {
     cum
 }
 
-/// Build the slot→symbol lookup used to decode, validating that the table sums to
-/// exactly [`TOTAL`] (a corrupt or truncated table is rejected, not trusted).
-fn slot_to_symbol(cum: &[u32; 257]) -> io::Result<Vec<u8>> {
-    if cum[256] != TOTAL {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "ANS: frequency table does not sum to the expected total",
-        ));
-    }
-    let mut table = vec![0u8; TOTAL as usize];
+// --- Encode / decode symbol tables -----------------------------------------
+
+/// Per-symbol encode parameters. The reciprocal (`rcp_freq`, `rcp_shift`) turns
+/// the rANS division by `freq` into a multiply-high and a shift; `bias` and
+/// `cmpl_freq` fold the cumulative offset and `TOTAL - freq` into the update.
+/// (Alverson's fixed-point reciprocal, the standard ryg-rANS construction.)
+#[derive(Clone, Copy)]
+struct EncSym {
+    x_max: u32,
+    rcp_freq: u32,
+    rcp_shift: u32,
+    bias: u32,
+    cmpl_freq: u32,
+}
+
+/// Build the per-symbol encode table for one block's frequencies.
+fn build_enc(freq: &[u16; 256], cum: &[u32; 257]) -> [EncSym; 256] {
+    let mut enc = [EncSym { x_max: 0, rcp_freq: 0, rcp_shift: 0, bias: 0, cmpl_freq: 0 }; 256];
     for s in 0..256 {
-        for slot in cum[s]..cum[s + 1] {
-            table[slot as usize] = s as u8;
+        let f = freq[s] as u32;
+        let start = cum[s];
+        // Renorm threshold: emit bytes until the state can absorb this symbol.
+        let x_max = ((RANS_L >> SCALE_BITS) << 8) * f;
+        let cmpl_freq = TOTAL - f;
+        let (rcp_freq, rcp_shift, bias) = if f < 2 {
+            // freq 0 (absent, never encoded) or 1: division by 1 needs no reciprocal.
+            (!0u32, 0u32, start + TOTAL - 1)
+        } else {
+            let mut shift = 0u32;
+            while f > (1u32 << shift) {
+                shift += 1;
+            }
+            let rcp = (((1u64 << (shift + 31)) + f as u64 - 1) / f as u64) as u32;
+            (rcp, shift - 1, start)
+        };
+        enc[s] = EncSym { x_max, rcp_freq, rcp_shift, bias, cmpl_freq };
+    }
+    enc
+}
+
+/// Build the packed `slot → (symbol, cum, freq)` decode table, validating that the
+/// frequencies sum to exactly [`TOTAL`] (a corrupt or truncated table is rejected,
+/// not trusted). Each entry packs `symbol` in bits 0..8, `cum` in 8..20, and
+/// `freq - 1` in 20..32 — one load per decoded symbol instead of three.
+fn build_dec(freq: &[u16; 256], cum: &[u32; 257]) -> io::Result<Vec<u32>> {
+    if cum[256] != TOTAL {
+        return Err(invalid("ANS: frequency table does not sum to the expected total"));
+    }
+    let mut dec = vec![0u32; TOTAL as usize];
+    for s in 0..256 {
+        let f = freq[s] as u32;
+        if f == 0 {
+            continue;
+        }
+        let start = cum[s];
+        // start <= 4095 (12 bits) and f-1 <= 4095 (12 bits), so all three fit a u32.
+        let packed = (s as u32) | (start << 8) | ((f - 1) << 20);
+        for slot in start..start + f {
+            dec[slot as usize] = packed;
         }
     }
-    Ok(table)
+    Ok(dec)
 }
 
 // --- Block codec -----------------------------------------------------------
 
-/// Entropy-code one block. rANS encodes back-to-front; the byte stream is then
-/// reversed so the decoder can read it front-to-back. The final 4 bytes (after
-/// reversal, the *first* 4) carry the terminal state.
-fn encode_block(data: &[u8], freq: &[u16; 256], cum: &[u32; 257]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len() / 2 + 16);
-    let mut x: u32 = RANS_L;
+/// Entropy-code one block with [`N_LANES`] interleaved rANS states.
+///
+/// rANS encodes back-to-front: renorm bytes are pushed in encode order, then the
+/// whole buffer is reversed once so the decoder reads it front-to-back. (Pushing
+/// and reversing beats writing into a pre-zeroed scratch buffer — the one O(n)
+/// reversal is far cheaper than initializing 1.5–2x the block up front.) The
+/// terminal states are pushed last (lane 0 last), so they land first after the
+/// reversal.
+fn encode_block(data: &[u8], enc: &[EncSym; 256]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 2 + 4 * N_LANES + 16);
+    let mut state = [RANS_L; N_LANES];
 
-    for &b in data.iter().rev() {
-        let f = freq[b as usize] as u32;
-        let c = cum[b as usize];
-        // Renormalize down so the division below cannot overflow the 32-bit state.
-        let x_max = ((RANS_L >> SCALE_BITS) << 8) * f;
-        while x >= x_max {
+    for i in (0..data.len()).rev() {
+        let lane = i & (N_LANES - 1);
+        let sym = &enc[data[i] as usize];
+        let mut x = state[lane];
+        // Renormalize down so the encode step cannot overflow the 32-bit state.
+        while x >= sym.x_max {
             out.push((x & 0xff) as u8);
             x >>= 8;
         }
-        x = ((x / f) << SCALE_BITS) + (x % f) + c;
+        // x = C(s, x), the division replaced by a reciprocal multiply.
+        let q = (((x as u64 * sym.rcp_freq as u64) >> 32) as u32) >> sym.rcp_shift;
+        state[lane] = x + sym.bias + q * sym.cmpl_freq;
     }
 
-    // Flush the terminal state. The whole buffer is reversed below so the decoder
-    // can read front-to-back; pushing the state big-endian here means it lands
-    // little-endian (and first) after that reversal.
-    out.extend_from_slice(&x.to_be_bytes());
+    // Flush terminal states big-endian and in reverse lane order; after the buffer
+    // is reversed they read back little-endian with lane 0 first.
+    for lane in (0..N_LANES).rev() {
+        out.extend_from_slice(&state[lane].to_be_bytes());
+    }
     out.reverse();
     out
 }
 
-/// Decode `n` symbols from a block stream produced by [`encode_block`].
-fn decode_block(
-    stream: &[u8],
-    n: usize,
-    freq: &[u16; 256],
-    cum: &[u32; 257],
-    slot2sym: &[u8],
-) -> io::Result<Vec<u8>> {
-    let truncated =
-        || io::Error::new(io::ErrorKind::InvalidData, "ANS: truncated block stream");
-    if stream.len() < 4 {
+/// Decode `n` symbols from a block stream produced by [`encode_block`], given the
+/// block's frequency table.
+fn decode_block(stream: &[u8], n: usize, freq: &[u16; 256]) -> io::Result<Vec<u8>> {
+    let truncated = || invalid("ANS: truncated block stream");
+    let cum = cumulative(freq);
+    let dec = build_dec(freq, &cum)?;
+
+    if stream.len() < 4 * N_LANES {
         return Err(truncated());
     }
-    let mut x = u32::from_le_bytes([stream[0], stream[1], stream[2], stream[3]]);
-    let mut pos = 4;
+    let mut state = [0u32; N_LANES];
+    let mut pos = 0usize;
+    for lane in &mut state {
+        *lane = u32::from_le_bytes([stream[pos], stream[pos + 1], stream[pos + 2], stream[pos + 3]]);
+        pos += 4;
+    }
 
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
-        let slot = x & MASK;
-        let s = slot2sym[slot as usize];
-        let f = freq[s as usize] as u32;
-        let c = cum[s as usize];
-        x = f * (x >> SCALE_BITS) + slot - c;
+    let mut out = vec![0u8; n];
+    for i in 0..n {
+        let lane = i & (N_LANES - 1);
+        let mut x = state[lane];
+        let slot = (x & MASK) as usize;
+        let packed = dec[slot];
+        let sym = (packed & 0xff) as u8;
+        let start = (packed >> 8) & 0xfff;
+        let f = ((packed >> 20) & 0xfff) + 1;
+        x = f * (x >> SCALE_BITS) + slot as u32 - start;
         // Renormalize up by pulling in bytes until the state re-enters its interval.
         while x < RANS_L {
             let byte = *stream.get(pos).ok_or_else(truncated)?;
             x = (x << 8) | byte as u32;
             pos += 1;
         }
-        out.push(s);
+        state[lane] = x;
+        out[i] = sym;
     }
     Ok(out)
 }
 
+/// Serialize one block to its on-wire form, header and stream coalesced into a
+/// single buffer: `[raw_len][nsym][(symbol, freq)...][stream_len][stream]`. Pure
+/// and self-contained, so a batch of these runs in parallel.
+fn serialize_block(block: &[u8]) -> Vec<u8> {
+    let counts = histogram(block);
+    let freq = normalize(&counts);
+    let cum = cumulative(&freq);
+    let enc = build_enc(&freq, &cum);
+    let stream = encode_block(block, &enc);
+
+    let present: Vec<usize> = (0..256).filter(|&i| freq[i] > 0).collect();
+    let mut out = Vec::with_capacity(4 + 2 + present.len() * 3 + 4 + stream.len());
+    // raw_len > 0 marks a data block (0 is reserved for the EOF marker).
+    out.extend_from_slice(&(block.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(present.len() as u16).to_le_bytes());
+    for i in present {
+        out.push(i as u8);
+        out.extend_from_slice(&freq[i].to_le_bytes());
+    }
+    out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+    out.extend_from_slice(&stream);
+    out
+}
+
 // --- Streaming writer ------------------------------------------------------
 
-/// A [`Write`] that entropy-codes its input with rANS, one [`BLOCK`] at a time.
+/// A [`Write`] that entropy-codes its input with rANS, one [`BLOCK`] at a time and
+/// a batch of blocks across every core.
 ///
 /// Call [`AnsWriter::finish`] to flush the final partial block and the
 /// end-of-stream marker; dropping without finishing leaves a truncated stream.
 pub struct AnsWriter<W: Write> {
     inner: W,
     buf: Vec<u8>,
+    pending: Vec<Vec<u8>>,
+    batch: usize,
     finished: bool,
 }
 
@@ -197,32 +330,26 @@ impl<W: Write> AnsWriter<W> {
     /// Wrap `inner`, writing the stream magic immediately.
     pub fn new(mut inner: W) -> io::Result<Self> {
         inner.write_all(MAGIC)?;
-        Ok(Self { inner, buf: Vec::with_capacity(BLOCK), finished: false })
+        let batch = rayon::current_num_threads().max(1);
+        Ok(Self {
+            inner,
+            buf: Vec::with_capacity(BLOCK),
+            pending: Vec::with_capacity(batch),
+            batch,
+            finished: false,
+        })
     }
 
-    /// Entropy-code and emit one block: `[raw_len][table][stream_len][stream]`.
-    fn emit_block(&mut self, block: &[u8]) -> io::Result<()> {
-        let mut counts = [0u32; 256];
-        for &b in block {
-            counts[b as usize] += 1;
+    /// Entropy-code the pending batch in parallel and write the results in order.
+    fn flush_batch(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
         }
-        let freq = normalize(&counts);
-        let cum = cumulative(&freq);
-        let stream = encode_block(block, &freq, &cum);
-
-        // raw_len > 0 marks a data block (0 is reserved for the EOF marker).
-        self.inner.write_all(&(block.len() as u32).to_le_bytes())?;
-
-        // The frequency table: a count of present symbols, then `(symbol, freq)`.
-        let present: Vec<usize> = (0..256).filter(|&i| freq[i] > 0).collect();
-        self.inner.write_all(&(present.len() as u16).to_le_bytes())?;
-        for i in present {
-            self.inner.write_all(&[i as u8])?;
-            self.inner.write_all(&freq[i].to_le_bytes())?;
+        let blocks = std::mem::take(&mut self.pending);
+        let encoded: Vec<Vec<u8>> = blocks.par_iter().map(|b| serialize_block(b)).collect();
+        for chunk in &encoded {
+            self.inner.write_all(chunk)?;
         }
-
-        self.inner.write_all(&(stream.len() as u32).to_le_bytes())?;
-        self.inner.write_all(&stream)?;
         Ok(())
     }
 
@@ -233,8 +360,9 @@ impl<W: Write> AnsWriter<W> {
         }
         if !self.buf.is_empty() {
             let block = std::mem::take(&mut self.buf);
-            self.emit_block(&block)?;
+            self.pending.push(block);
         }
+        self.flush_batch()?;
         self.inner.write_all(&0u32.to_le_bytes())?; // EOF: a zero-length block.
         self.inner.flush()?;
         self.finished = true;
@@ -249,11 +377,34 @@ impl<W: Write> AnsWriter<W> {
 
 impl<W: Write> Write for AnsWriter<W> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.buf.extend_from_slice(data);
-        while self.buf.len() >= BLOCK {
-            let block: Vec<u8> = self.buf.drain(..BLOCK).collect();
-            self.emit_block(&block)?;
+        let mut rest = data;
+
+        // Top up a partially-filled block from a previous call first.
+        if !self.buf.is_empty() {
+            let take = (BLOCK - self.buf.len()).min(rest.len());
+            self.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.buf.len() == BLOCK {
+                let block = std::mem::replace(&mut self.buf, Vec::with_capacity(BLOCK));
+                self.pending.push(block);
+                if self.pending.len() >= self.batch {
+                    self.flush_batch()?;
+                }
+            }
         }
+
+        // Slice whole blocks straight from the input — one copy into the batch,
+        // no quadratic shuffling of a growing buffer.
+        while rest.len() >= BLOCK {
+            self.pending.push(rest[..BLOCK].to_vec());
+            rest = &rest[BLOCK..];
+            if self.pending.len() >= self.batch {
+                self.flush_batch()?;
+            }
+        }
+
+        // Stash whatever is left of this write for next time.
+        self.buf.extend_from_slice(rest);
         Ok(data.len())
     }
 
@@ -266,12 +417,21 @@ impl<W: Write> Write for AnsWriter<W> {
 
 // --- Streaming reader ------------------------------------------------------
 
-/// A [`Read`] that decodes an rANS stream produced by [`AnsWriter`].
+/// One block as read off the wire, before decoding.
+struct RawBlock {
+    raw_len: usize,
+    freq: [u16; 256],
+    stream: Vec<u8>,
+}
+
+/// A [`Read`] that decodes an rANS stream produced by [`AnsWriter`], a batch of
+/// blocks across every core.
 pub struct AnsReader<R: Read> {
     inner: R,
     out: Vec<u8>,
     pos: usize,
     eof: bool,
+    batch: usize,
 }
 
 impl<R: Read> AnsReader<R> {
@@ -280,45 +440,65 @@ impl<R: Read> AnsReader<R> {
         let mut magic = [0u8; 4];
         inner.read_exact(&mut magic)?;
         if &magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not an Abyss ANS stream (bad magic)",
-            ));
+            return Err(invalid("not an Abyss ANS stream (bad or outdated magic)"));
         }
-        Ok(Self { inner, out: Vec::new(), pos: 0, eof: false })
+        let batch = rayon::current_num_threads().max(1);
+        Ok(Self { inner, out: Vec::new(), pos: 0, eof: false, batch })
     }
 
-    /// Read, decode, and buffer the next block. Sets `eof` at the marker.
-    fn fill(&mut self) -> io::Result<()> {
+    /// Read one block's header and stream off the wire (no decoding yet).
+    fn read_block(&mut self) -> io::Result<Option<RawBlock>> {
         let raw_len = read_u32(&mut self.inner)?;
         if raw_len == 0 {
-            self.eof = true;
-            return Ok(());
+            return Ok(None); // EOF marker.
         }
         if raw_len as usize > BLOCK {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ANS: implausible block length"));
+            return Err(invalid("ANS: implausible block length"));
         }
 
         let nsym = read_u16(&mut self.inner)? as usize;
         if nsym > 256 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ANS: implausible symbol count"));
+            return Err(invalid("ANS: implausible symbol count"));
         }
+        // Pull the whole frequency table in one read, then parse it.
+        let mut table = vec![0u8; nsym * 3];
+        self.inner.read_exact(&mut table)?;
         let mut freq = [0u16; 256];
-        for _ in 0..nsym {
-            let sym = read_u8(&mut self.inner)? as usize;
-            freq[sym] = read_u16(&mut self.inner)?;
+        for entry in table.chunks_exact(3) {
+            freq[entry[0] as usize] = u16::from_le_bytes([entry[1], entry[2]]);
         }
-        let cum = cumulative(&freq);
-        let slot2sym = slot_to_symbol(&cum)?;
 
         let stream_len = read_u32(&mut self.inner)? as usize;
         if stream_len > 2 * BLOCK + 64 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ANS: implausible stream length"));
+            return Err(invalid("ANS: implausible stream length"));
         }
         let mut stream = vec![0u8; stream_len];
         self.inner.read_exact(&mut stream)?;
 
-        self.out = decode_block(&stream, raw_len as usize, &freq, &cum, &slot2sym)?;
+        Ok(Some(RawBlock { raw_len: raw_len as usize, freq, stream }))
+    }
+
+    /// Read a batch of blocks, decode them in parallel, and buffer the result.
+    fn fill(&mut self) -> io::Result<()> {
+        let mut raws: Vec<RawBlock> = Vec::with_capacity(self.batch);
+        while raws.len() < self.batch {
+            match self.read_block()? {
+                Some(rb) => raws.push(rb),
+                None => {
+                    self.eof = true;
+                    break;
+                }
+            }
+        }
+
+        let decoded: Vec<io::Result<Vec<u8>>> =
+            raws.par_iter().map(|rb| decode_block(&rb.stream, rb.raw_len, &rb.freq)).collect();
+
+        let mut out = Vec::new();
+        for chunk in decoded {
+            out.extend_from_slice(&chunk?);
+        }
+        self.out = out;
         self.pos = 0;
         Ok(())
     }
@@ -342,12 +522,6 @@ impl<R: Read> Read for AnsReader<R> {
 }
 
 // --- Little-endian reader helpers ------------------------------------------
-
-fn read_u8<R: Read>(r: &mut R) -> io::Result<u8> {
-    let mut b = [0u8; 1];
-    r.read_exact(&mut b)?;
-    Ok(b[0])
-}
 
 fn read_u16<R: Read>(r: &mut R) -> io::Result<u16> {
     let mut b = [0u8; 2];
@@ -389,6 +563,15 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_tiny_partial_lanes() {
+        // Fewer symbols than lanes — exercises the unused-but-flushed lanes.
+        for n in 0..=8usize {
+            roundtrip(&vec![b'q'; n]);
+            roundtrip(&(0..n as u8).collect::<Vec<u8>>());
+        }
+    }
+
+    #[test]
     fn roundtrips_text() {
         let mut data = Vec::new();
         for i in 0..20_000u32 {
@@ -411,8 +594,31 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_multiblock_parallel() {
+        // Several megabytes spanning many blocks, mixing structure and noise so the
+        // parallel batch path and per-block tables are all exercised.
+        let mut data = Vec::with_capacity(5 * 1024 * 1024);
+        let mut state = 0xC0FF_EE00u32;
+        while data.len() < 5 * 1024 * 1024 {
+            data.extend_from_slice(b"depths fold into a glowing orb; ");
+            for _ in 0..16 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                data.push((state >> 24) as u8);
+            }
+        }
+        roundtrip(&data);
+    }
+
+    #[test]
+    fn roundtrips_exact_block_boundaries() {
+        roundtrip(&vec![b'z'; BLOCK]);
+        roundtrip(&vec![b'z'; BLOCK + 1]);
+        roundtrip(&vec![b'z'; 2 * BLOCK]);
+    }
+
+    #[test]
     fn rejects_bad_magic() {
-        let mut bytes = b"XXXX".to_vec();
+        let mut bytes = b"ANS1".to_vec();
         bytes.extend_from_slice(&0u32.to_le_bytes());
         assert!(AnsReader::new(&bytes[..]).is_err());
     }
